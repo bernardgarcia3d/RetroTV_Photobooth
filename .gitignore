@@ -1,0 +1,15 @@
+.gradle/
+.gradle-*/
+.kotlin/
+.android/
+.idea/
+build/
+**/build/
+local.properties
+*.iml
+*.apk
+*.aab
+releases/**/*.apk
+node_modules/
+output/
+.codex-remote-attachments/

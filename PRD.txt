@@ -1,0 +1,529 @@
+# RetroTV Photobooth Product Requirements Document
+
+Implementation status (2026-10-04): The current MVP is an Android Compose kiosk plus an optional Cloudflare Worker/R2 delivery service. The implemented local product includes adaptive portrait/landscape guest mode, CRT/retro visual treatment, branded activation, camera permission and CameraX capture, persisted Rental/Business session modes, Business PIN verification, one shared configurable 1–10 print price table for both modes, quantity-aware durable print jobs, static/configured payment QR display with explicit manual/test-payment gating, one/three/four/six-photo layouts, layout-driven countdown capture, local session/configuration persistence, full-output sticker editing, guest brightness and thermal preview, GIF and digital-strip rendering, PIN-protected operator settings, layout naming and visual presets, USB discovery and permission handling, XP-D4601B diagnostics, XP-80TS receipt printing with tuning controls, durable print queue/retry/error states, animated print processing, and local fallback delivery. Rental mode skips only the payment and PIN gates and keeps the same local print plus Digital Photo/GIF QR delivery flow. The optional delivery service accepts booth-authenticated uploads and issues one-hour opaque links for the digital strip and GIF. Live QRPH payment verification, backend configuration publishing, operator accounts, galleries, and automated upload retry/retention orchestration remain future work.
+
+The PRD distinguishes implemented behavior from planned production capabilities. A local/demo QR or static payment QR must never be described as verified payment or a secure commercial gallery.
+
+## 1. Product Overview
+
+RetroTV Photobooth is a self-service Android tablet kiosk for cafes, restaurants, events, and rental units. A guest uses a retro television-inspired interface to pay or present payment for one fixed-price personalized printed photo strip, chooses a photo layout, takes the required number of photos, adds stickers, receives one printed strip, and can receive the animated GIF and digital strip through a time-limited QR link when cloud delivery is configured.
+
+The current MVP stores configuration locally behind an operator PIN. A future backend will publish versioned event configuration and cache it locally for reliable booth operation.
+
+The physical print remains local-first. Internet services are required for payment confirmation and digital delivery, but network problems must never erase a paid session or prevent the operator from recovering it.
+
+## 2. Problem
+
+Cafes, restaurants, venues, and event operators want a small self-service attraction that can generate paid keepsakes without a full traditional photobooth. Existing camera apps do not combine payment gating, selectable photo layouts, sticker customization, branded thermal printing, and private digital delivery in one controlled flow.
+
+Operators also need to customize the experience for their business without changing the Android application code or manually rebuilding the kiosk for every event.
+
+## 3. Users and Commercial Models
+
+### Guest
+
+The person using the public kiosk. They need a clear payment flow, obvious progress, a quick capture experience, one printed keepsake, and simple digital downloads without creating an account.
+
+### Operator
+
+The cafe staff member, rental operator, venue employee, or booth owner who configures and runs the station. They need to set the price and branding, confirm readiness, recover failed payments or prints, and view basic counters.
+
+### Organizer or brand manager
+
+The person responsible for an event or brand. They need reusable profiles, event-specific customization, private media controls, and a way to publish the correct configuration to one or more devices.
+
+### Commercial models
+
+1. **Software platform:** the venue owns the tablet and printer and pays for the software service.
+2. **Complete package:** the business buys a configured tablet, printer, enclosure, cables, power equipment, paper, and software.
+3. **Rental unit:** the business rents a prepared kiosk for a day or event.
+
+The configuration model must support all three. Price belongs to the operator/event session offer, not to a photo layout.
+
+## 4. Product Decisions
+
+### Fixed session price
+
+Each operator configures one price for one paid photo session. The guest receives one printed strip regardless of the selected layout.
+
+Layouts change the number and arrangement of photos, but never change the price in the initial product.
+
+### One printed keepsake
+
+The printer produces one personalized photo strip per paid session. The strip may contain one, three, four, or six photos depending on the selected layout.
+
+The printed strip is a photo keepsake, not the system of record for payment. Payment status is recorded by the payment provider and backend.
+
+### Payment before layout selection
+
+The production flow will unlock layout selection only after server-confirmed payment. In the current MVP, the payment screen can show configured static payment QR tiles and a clearly labelled test/manual confirmation path; it does not verify QRPH payment.
+
+### Backend-controlled customization
+
+Operators customize event configuration through the backend. The tablet downloads a published, versioned configuration and uses it for new sessions. The tablet may provide hardware and recovery controls but must not silently override the published price or branding.
+
+## 5. Goals
+
+1. Let a guest complete payment, layout selection, capture, sticker customization, printing, and digital delivery without staff assistance.
+2. Let an operator configure price, layouts, branding, fonts, text, stickers, and event settings without modifying the app.
+3. Produce one reliable printed strip for every successfully completed paid session.
+4. Prevent the kiosk from unlocking after a QR scan alone; only a verified payment event can unlock a paid session.
+5. Preserve paid sessions locally when printing, uploading, or QR delivery fails.
+6. Keep photographs private, temporary, revocable, and scoped to the correct event.
+7. Support one validated Samsung tablet and one validated Xprinter reference model before expanding hardware support.
+
+## 6. Non-Goals for the First MVP
+
+- Variable pricing by layout
+- Charging per photo or per print copy
+- Customer accounts or guest registration
+- Face recognition, selfie matching, or biometric search
+- Source-photo download as a guest feature; the first digital download is the final strip and animated GIF
+- Public searchable galleries
+- Multiple printers or broad printer compatibility before the XP-80T is validated
+- In-app refunds, chargebacks, or full accounting workflows
+- Arbitrary customer-uploaded fonts or sticker assets
+- iOS, desktop capture, or web capture
+
+## 7. Guest Experience
+
+### Flow A: paid kiosk session
+
+1. Guest taps the camera landing screen.
+2. The kiosk shows the branded title/activation page.
+3. Guest taps `Start Session` on the title page.
+4. The kiosk creates a pending payment order for the operator's fixed session price.
+5. The kiosk displays a QRPH payment QR and a waiting state.
+6. The backend receives and validates the payment-provider confirmation.
+7. The kiosk displays `Payment received` and unlocks the layout screen.
+8. Guest chooses one enabled layout: one, three, four, or six photos.
+9. The app shows the selected photo count and starts the countdown sequence.
+10. The app captures the required number of photos and shows progress such as `Photo 2 of 4`.
+11. The app shows the complete branded print strip or grid, using all captured photos in the selected layout.
+12. Guest selects and positions stickers directly on that full-output preview, rather than on individual source photos.
+13. Guest confirms the final design or retakes the session.
+14. The app saves source photos, sticker placements, final digital strip, and GIF locally. The final digital strip and GIF are also published to the tablet Gallery under `Pictures/RetroTV PhotoBooth`; these Gallery copies have no automatic deletion and are cleaned up manually by the operator.
+15. The app submits one print job for one receipt-style photo strip.
+16. The app uploads digital assets in the background.
+17. In the local MVP, after the print is submitted, the kiosk displays an explicitly local/demo QR page for validation. Once backend digital delivery is connected, the kiosk displays a signed-download QR page with:
+    - Download animated GIF
+    - Download digital photo strip
+16. Guest taps Done or the kiosk resets automatically after a safe timeout.
+
+### Payment recovery
+
+- A QR scan does not equal payment success.
+- Payment status must be confirmed by the backend using the payment provider's authenticated event or status API.
+- Pending payments expire and cannot unlock a session after expiry.
+- A paid but abandoned session remains visible to the operator for recovery or controlled expiry.
+- Payment credentials and provider secrets never live in the APK.
+- If payment service is unavailable, the kiosk does not claim payment was received and does not start a guest session.
+
+### Flow B: offline and failure recovery
+
+1. The kiosk detects its network or payment-service problem before showing payment.
+2. It displays a clear unavailable message and a staff recovery path.
+3. A paid session that loses connectivity after confirmation remains locally saved.
+4. Printing continues from the local queue.
+5. Digital uploads retry when connectivity returns.
+6. Operator controls show payment, print, upload, and QR-delivery status separately.
+
+## 8. Operator Backend
+
+The backend dashboard is the source of truth for commercial and creative configuration.
+
+### Operator settings
+
+- Operator/business name and contact information
+- Fixed session price and currency
+- QRPH/payment-provider configuration status
+- Active event and device assignments
+- Available layouts
+- Logo and brand colors
+- Header and footer text
+- Approved font selection and text sizes
+- Backgrounds, frames, and sticker packs
+- QR/GIF enablement and download expiry
+- Gallery enablement and retention period
+- Device status and last synchronization
+- Session, payment, print, upload, and download counters
+
+### Event publishing
+
+1. Operator creates or selects an organizer profile.
+2. Operator creates an event.
+3. Operator selects a branding profile and enabled layouts.
+4. Operator sets the event price, payment settings, retention, and digital-download rules.
+5. Operator previews the start screen, layout screen, sticker screen, print strip, and QR page.
+6. Operator publishes the configuration to the selected tablet.
+7. The event stores an immutable configuration snapshot for every new session.
+
+Editing a reusable branding profile must not change completed sessions. Editing an active event must create a new configuration version and apply only to sessions created after publication.
+
+### Tablet-only operator settings
+
+The protected tablet settings screen handles local hardware and recovery:
+
+- Camera permission and camera test
+- USB printer discovery and permission
+- Printer connection and paper reminder
+- Test print
+- Print queue and retry
+- Upload retry
+- Local storage and battery state
+- Configuration version and last sync
+- PIN-protected kiosk exit and emergency recovery
+
+The tablet must not expose unrestricted price or branding changes to guests.
+
+## 9. Creative Configuration
+
+### Layout definitions
+
+Each layout contains:
+
+- Stable layout ID
+- Display name and preview image
+- Required photo count
+- Photo-frame positions and crop rules
+- Header/footer placement
+- Sticker-safe area
+- Print dimensions
+- Enabled/disabled state
+
+Initial layouts:
+
+1. One-photo portrait
+2. Three-photo strip
+3. Four-photo grid
+4. Six-photo grid
+
+### Fonts and text
+
+Operators select from bundled or licensed fonts. They can configure:
+
+- Font family
+- Header and footer text
+- Font size
+- Text color
+- Alignment
+- Letter spacing where supported
+
+Arbitrary font-file uploads are out of scope for the first MVP.
+
+### Stickers
+
+The first sticker editor supports approved transparent sticker and emoji assets on the complete final strip/grid. The tray is horizontally scrollable and can be grouped into themed packs as the catalog grows. A guest taps a sticker in the tray to add it, taps it to select it, drags it to move it, pinches it to resize it, double-taps the selected sticker to duplicate it at the touched location, and uses Delete to remove the selected sticker. Rotation is deferred until post-pilot evidence shows it is needed.
+
+Sticker placements are saved as session data so the final strip, GIF, and digital copy use the same design.
+
+### Guest photo adjustment
+
+The customization screen shows the complete assembled output and a guest brightness slider. The slider is labeled `Darker` to `Brighter` and updates the preview immediately. The preview uses a print-oriented black-and-white treatment so guests can see the approximate thermal result before confirming. The MVP applies the adjustment consistently to all captured photos in the final output; per-photo adjustment is deferred.
+
+Guest brightness is a session creative setting and is separate from the operator's printer brightness, dither, and feed settings. The guest setting is stored with the session and is applied to the printed strip, GIF, and digital strip render.
+
+### Operator-customized layout designs
+
+The layout geometry remains controlled by the product for reliable capture and paper output, while the operator can customize each available layout's display name and visual preset. A preset includes accent color, background color, and photo-frame color. Operators can enable or disable layouts, preview the result, and save the configuration from the protected tablet settings in Release 1. The same fields are part of the backend `LayoutDefinition`/branding configuration for Release 2, so local settings do not create a second product model.
+
+### Animated print processing
+
+After the guest confirms customization, the processing screen shows the assembled strip moving down through a printer-style viewport while the app renders and submits the print job. The animation communicates the intended physical action but does not claim that paper has physically exited. The durable print queue remains the source of truth and the guest completion screen still reports queued, printing, printed, or failed status.
+
+## 10. Data Model
+
+All backend IDs use UUIDs. Raw payment tokens, guest bearer tokens, and permanent media URLs are never stored or exposed.
+
+### Organizer
+
+- id
+- name
+- contact_name
+- contact_email
+- created_at
+- updated_at
+
+### OperatorUser
+
+- id
+- organizer_id
+- role: owner, manager, staff
+- name
+- email
+- created_at
+- disabled_at
+
+### BrandingProfile
+
+- id
+- organizer_id
+- name
+- logo_asset_id
+- primary_color
+- secondary_color
+- default_font_id
+- strip_header
+- strip_footer
+- default_frame_asset_id
+- sticker_pack_ids
+- created_at
+- updated_at
+
+### LayoutDefinition
+
+- id
+- organizer_id, nullable for system layouts
+- name
+- photo_count
+- template_definition
+- preview_asset_id
+- enabled
+- created_at
+- updated_at
+
+### Event
+
+- id
+- organizer_id
+- name
+- starts_at
+- ends_at
+- status: draft, published, active, closed, archived, deleted
+- fixed_session_price_minor
+- currency
+- branding_snapshot
+- enabled_layout_ids
+- configuration_version
+- gallery_enabled
+- retention_until
+- created_at
+- updated_at
+- deleted_at
+
+### Device
+
+- id
+- organizer_id
+- event_id
+- device_label
+- device_session_key_hash
+- app_version
+- configuration_version
+- last_seen_at
+- created_at
+
+### PaymentAttempt
+
+- id
+- event_id
+- device_id
+- amount_minor
+- currency
+- provider
+- provider_reference
+- status: pending, paid, expired, failed, cancelled, consumed
+- expires_at
+- paid_at
+- consumed_at
+- provider_event_id
+- created_at
+- updated_at
+
+### PhotoSession
+
+- id
+- event_id
+- device_id
+- payment_attempt_id
+- device_session_id
+- configuration_version
+- layout_id
+- captured_at
+- sticker_placements
+- local_status: paid, captured, rendered, print_pending, printed, print_failed, completed, deleted
+- upload_status: pending, uploading, uploaded, failed, deleted
+- digital_access_expires_at
+- created_at
+- updated_at
+- deleted_at
+
+### MediaAsset
+
+- id
+- event_id
+- photo_session_id
+- asset_type: source_photo, final_print_strip, digital_strip, animated_gif, logo, frame, sticker
+- storage_key
+- checksum
+- content_type
+- byte_size
+- width
+- height
+- upload_status
+- created_at
+- deleted_at
+
+### PrintJob
+
+- id
+- photo_session_id
+- printer_profile
+- strip_path
+- status: queued, printing, printed, failed
+- attempts
+- last_error
+- created_at
+- updated_at
+
+### DownloadAccess
+
+- id
+- event_id
+- photo_session_id
+- token_hash
+- scope: digital_strip, animated_gif, session_download, gallery_access
+- expires_at
+- revoked_at
+- created_at
+
+### OperationalEvent
+
+- id
+- device_id
+- event_id
+- photo_session_id, nullable
+- payment_attempt_id, nullable
+- type: payment_pending, payment_success, payment_failed, capture_complete, print_success, print_failed, upload_success, upload_failed, qr_displayed, download_opened, download_completed
+- metadata: non-sensitive diagnostic JSON
+- occurred_at
+
+## 11. Technical Requirements
+
+### Android tablet application
+
+- Kotlin and Jetpack Compose.
+- CameraX for camera preview and capture, with portrait-oriented 4:3 source capture and JPEG EXIF-orientation normalization before review or rendering.
+- Adaptive kiosk orientation on the Samsung Galaxy Tab S9 reference device, with portrait-safe and landscape tablet layouts.
+- Local Room/SQLite storage for configuration snapshots, sessions, payment state, media, print queue, and retry state.
+- App-private media storage with cleanup that preserves pending print/upload jobs.
+- Background rendering, printing, and upload work off the UI thread.
+- Guest brightness adjustment is applied during final strip rendering; the preview applies a grayscale thermal approximation before confirmation.
+- The print-processing animation is time-bounded and independent from printer acknowledgement; printer state continues to come from the durable print queue.
+- WorkManager or equivalent retry system with idempotency and network constraints.
+- Configuration sync must validate the event, device, version, checksum, and expiry before applying it.
+- Guest mode must not allow accidental exit or operator-setting access.
+
+### Backend and payment
+
+- Authenticated operator API for organizers, users, branding, layouts, pricing, events, devices, and deletion.
+- Server endpoint to create a payment attempt for the configured fixed session price.
+- QRPH/payment-provider adapter behind a provider-neutral interface.
+- Authenticated provider webhook/status handling with signature verification, idempotency, and replay protection.
+- A payment must be linked to one event, one device, one amount, and one session entitlement.
+- The app polls or receives a narrow payment-status response; it never receives provider secrets.
+- Payment status must be auditable and reconcileable by the operator.
+
+### Printing
+
+- Validate one USB Xprinter XP-80T profile with 80 mm paper and 576-dot target width.
+- Use Android USB Host APIs and USB permission handling.
+- Use the XP-D4601B only for USB discovery, permission, diagnostic label, and scaled proof-print testing; do not tune or accept the final receipt layout with it.
+- Convert the final configured strip into high-contrast printer-safe raster output.
+- Submit one print job per paid session.
+- Mark a job printed only after the printer adapter acknowledges the submission.
+- Retry failed jobs without creating duplicate sessions.
+
+### Digital delivery
+
+- Render GIF and digital strip locally before upload.
+- Upload assets to private storage using idempotent session and checksum keys.
+- Display download QR only after the backend has confirmed digital availability, or show an explicitly local/demo or non-ready preparation state.
+- Provide one mobile-friendly download page with both GIF and digital-strip actions.
+- Issue short-lived signed URLs per asset and scope.
+- Revoke access on deletion, expiration, event closure, or operator action.
+
+### Privacy and retention
+
+- Treat all photos as private event media by default.
+- Provide a concise capture and retention notice.
+- Allow event-level retention and deletion settings.
+- Delete local and cloud media according to retention policy while preserving operational audit records without raw media URLs.
+- Do not collect guest identity unless a later feature explicitly requires it.
+
+## 12. Delivery Plan
+
+### Release 1: configurable local kiosk
+
+- Refactor the current guest flow into a session state machine.
+- Add fixed-price session configuration with a mock payment gate.
+- Add layout selection for one, three, four, and six photos.
+- Make photo count drive capture and rendering.
+- Add basic sticker selection and placement.
+- Add a scrollable sticker/emoji tray with approved themed assets.
+- Add guest brightness adjustment with grayscale thermal preview and persist the setting with each session.
+- Add operator-customizable per-layout names and visual presets while preserving fixed, validated layout geometry.
+- Add a printer-style animated processing page while the local print job is rendered and submitted.
+- Make fonts, text, branding, and layouts renderer configuration rather than hardcoded values.
+- Add USB printer discovery, readiness screen, test print, and durable print retry.
+
+### Release 2: operator backend and real payment (planned)
+
+- Add operator accounts and roles.
+- Add organizer, event, pricing, branding, font, layout, and sticker configuration.
+- Add published device configuration and local cache.
+- Select and integrate one QRPH-compatible payment provider.
+- Add verified payment webhook/status flow and payment reconciliation.
+- Replace mock payment gate with real payment unlock.
+
+### Release 3: digital delivery and gallery (partially implemented)
+
+- Implemented: local GIF and digital-strip rendering.
+- Implemented: optional booth-authenticated Cloudflare Worker/R2 upload.
+- Implemented: separate opaque, one-hour download links for GIF and digital strip.
+- Implemented: local fallback when cloud delivery is not configured or unavailable.
+- Remaining: durable upload retry state, operator gallery, event scoping in a backend data model, revocation/deletion controls, and production retention jobs.
+- Add private event gallery, expiry, revocation, and deletion.
+- Add operator metrics and event export.
+
+## 13. Acceptance Criteria
+
+1. An operator can set a fixed price, branding, fonts, text, stickers, and enabled layouts in the backend.
+2. Publishing a configuration updates the assigned tablet without changing completed sessions.
+3. A guest cannot reach layout selection until the backend confirms payment for the configured amount.
+4. Every enabled layout produces exactly one print job for one printed strip.
+5. Selecting one, three, four, or six photos changes the capture count and final template correctly.
+6. Sticker placements appear consistently in the preview, printed strip, GIF, and digital strip.
+7. A guest can scroll through the approved sticker/emoji tray, add multiple stickers, drag and resize them, duplicate one with a double tap, and remove the selected sticker.
+8. A guest brightness change updates the thermal preview and is reflected in the rendered strip, GIF, and digital strip without changing the operator printer tuning.
+9. An operator can rename enabled layouts and choose their visual presets; the guest layout screen and final output reflect the saved configuration.
+10. The processing screen shows the final output moving through a printer-style viewport while the print job is submitted, then hands off to the durable print status screen.
+11. A failed print remains in the local queue with a retry action and does not create a second paid session.
+12. A payment timeout, duplicate webhook, app restart, or network interruption does not unlock duplicate sessions.
+13. A guest QR page provides the correct GIF and digital strip only while access is valid.
+14. Expired, revoked, deleted, or cross-event tokens expose no media.
+15. Operator reports can reconcile paid sessions, print jobs, failed jobs, and successful digital downloads.
+16. The full flow works on the reference Samsung tablet and XP-80T after hardware validation.
+
+## 14. Pilot Metrics
+
+- Payment-to-layout transition success rate
+- Percentage of paid sessions completed
+- Capture-to-print completion time
+- Print success rate without staff intervention
+- Failed print and retry rate
+- Digital QR readiness rate within two minutes
+- GIF and digital-strip download completion rate
+- Payment mismatch or duplicate-unlock incidents
+- Configuration sync failures
+- Repeat deployment by the same operator
+
+## 15. Open Decisions
+
+1. Confirm the exact fixed price and currency per operator/event.
+2. Select the QRPH-compatible payment provider and merchant onboarding path.
+3. Confirm whether the operator backend is web-based first or tablet-only during the pilot.
+4. Confirm the initial font list, sticker pack, branding assets, and four layout templates.
+5. Confirm the Samsung Galaxy Tab S9 model number and Android version.
+6. Confirm the XP-80T USB variant, powered USB-C OTG hub, paper, and power setup.
+7. Confirm GIF frame duration, maximum file size, download expiry, and event retention period.

@@ -1,0 +1,10 @@
+name = "photobooth-booth2-delivery"
+main = "src/index.js"
+compatibility_date = "2026-10-03"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "photobooth-media-booth-2"
+
+[triggers]
+crons = ["*/15 * * * *"]
