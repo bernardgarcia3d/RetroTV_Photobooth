@@ -10,6 +10,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.eventphotobooth.app.ui.EventPhotoboothApp
 import com.eventphotobooth.app.ui.BoothLightColors
+import com.eventphotobooth.app.ui.BoothShapes
 import com.eventphotobooth.app.ui.BoothTypography
 
 class MainActivity : ComponentActivity() {
@@ -25,6 +26,7 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(
                 colorScheme = BoothLightColors,
                 typography = BoothTypography,
+                shapes = BoothShapes,
             ) {
                 EventPhotoboothApp()
             }

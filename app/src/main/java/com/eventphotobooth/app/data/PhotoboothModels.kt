@@ -40,6 +40,11 @@ data class LocalPhotoSession(
     val uploadStatus: UploadStatus = UploadStatus.LOCAL_ONLY,
     val digitalStripPath: String? = null,
     val animatedGifPath: String? = null,
+    val borderTemplateId: String? = null,
+    val borderTemplateVersion: Int? = null,
+    val accessCodeId: String? = null,
+    val accessCodePackageId: String? = null,
+    val accessCodeBoothId: String? = null,
 )
 
 data class PrintJob(

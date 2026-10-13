@@ -10,6 +10,8 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
 import com.eventphotobooth.app.data.BrandSnapshot
+import com.eventphotobooth.app.data.LayoutId
+import com.eventphotobooth.app.data.PhotoLayoutSpecs
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -20,6 +22,7 @@ class LocalGifRenderer {
         finalStripFile: File,
         brand: BrandSnapshot,
         outputFile: File,
+        layoutId: LayoutId,
         guestPhotoBrightness: Int = 50,
     ): File {
         require(sourcePhotos.isNotEmpty()) { "At least one source photo is required for GIF output." }
@@ -32,7 +35,7 @@ class LocalGifRenderer {
         val frames = buildList {
             sourcePhotos.forEachIndexed { index, photo ->
                 BitmapFactory.decodeFile(photo.absolutePath)?.let { source ->
-                    add(renderSourceFrame(source, brand, targetWidth, targetHeight, index + 1, sourcePhotos.size, guestPhotoBrightness))
+                    add(renderSourceFrame(source, brand, targetWidth, targetHeight, index + 1, sourcePhotos.size, layoutId, guestPhotoBrightness))
                     source.recycle()
                 }
             }
@@ -59,6 +62,7 @@ class LocalGifRenderer {
         height: Int,
         index: Int,
         total: Int,
+        layoutId: LayoutId,
         guestPhotoBrightness: Int,
     ): Bitmap {
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -79,7 +83,15 @@ class LocalGifRenderer {
         textPaint.textSize = 14f
         canvas.drawText("${brand.organizerName} · Photo $index of $total", width / 2f, 70f, textPaint)
 
-        val imageRect = Rect(18, 92, width - 18, height - 88)
+        val imageLeft = 18
+        val imageRight = width - 18
+        val imageWidth = imageRight - imageLeft
+        val availableImageHeight = height - 180
+        val imageHeight = (imageWidth / PhotoLayoutSpecs.forLayout(layoutId).photoAspectRatio)
+            .toInt()
+            .coerceAtMost(availableImageHeight)
+        val imageTop = 92 + ((availableImageHeight - imageHeight) / 2).coerceAtLeast(0)
+        val imageRect = Rect(imageLeft, imageTop, imageRight, imageTop + imageHeight)
         drawCenterCrop(canvas, source, imageRect, guestPhotoBrightness)
 
         textPaint.textSize = 13f
@@ -100,17 +112,10 @@ class LocalGifRenderer {
     }
 
     private fun drawCenterCrop(canvas: Canvas, source: Bitmap, destination: Rect, guestPhotoBrightness: Int) {
-        val sourceRatio = source.width.toFloat() / source.height
-        val destinationRatio = destination.width().toFloat() / destination.height()
-        val sourceRect = if (sourceRatio > destinationRatio) {
-            val cropWidth = (source.height * destinationRatio).toInt()
-            val left = (source.width - cropWidth) / 2
-            Rect(left, 0, left + cropWidth, source.height)
-        } else {
-            val cropHeight = (source.width / destinationRatio).toInt()
-            val top = (source.height - cropHeight) / 2
-            Rect(0, top, source.width, top + cropHeight)
-        }
+        val sourceRect = com.eventphotobooth.app.render.centerCropSourceRect(
+            source,
+            destination.width().toFloat() / destination.height().toFloat(),
+        )
         val brightnessOffset = (guestPhotoBrightness.coerceIn(0, 100) - 50) * 2f
         val matrix = ColorMatrix(
             floatArrayOf(

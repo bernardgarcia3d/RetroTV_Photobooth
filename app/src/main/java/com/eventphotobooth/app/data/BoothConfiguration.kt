@@ -18,6 +18,7 @@ enum class LayoutId(
 enum class BoothOperationMode(val label: String) {
     RENTAL("Rental mode"),
     BUSINESS("Business mode"),
+    CODE_ACCESS("Code access"),
 }
 
 data class LayoutDesign(
@@ -25,6 +26,17 @@ data class LayoutDesign(
     val accentColor: Long,
     val backgroundColor: Long = 0xFFFFFFFF,
     val frameColor: Long = 0xFFE1EAE6,
+)
+
+data class ReceiptTemplate(
+    val title: String = "RECEIPT",
+    val primaryText: String = "YOUR MOMENTS",
+    val secondaryText: String = "KEEP THE MEMORY",
+    val postTotalText: String = "THANK YOU FOR VISITING",
+    val noteLabel: String = "LEAVE A NOTE HERE:",
+    val noteText: String = "",
+    val barcodeCaption: String = "THANK YOU!",
+    val logoUri: String = "",
 )
 
 fun defaultPrintPriceTiersMinor() = listOf(2500, 4000, 6000, 8000, 10000, 12000, 14000, 16000, 18000, 20000)
@@ -40,6 +52,8 @@ data class BoothConfiguration(
     val venueName: String = "Your venue",
     val header: String = "PHOTO MOMENT",
     val logoText: String = "PB",
+    /** App-private normalized image used only on the Your Moment welcome screen. */
+    val welcomeLogoPath: String = "",
     val footer: String = "Thanks for visiting",
     val priceMinor: Int = 2500,
     val currency: String = "PHP",
@@ -56,11 +70,13 @@ data class BoothConfiguration(
     val thermalPrintBrightness: Int = 50,
     val thermalDitherThreshold: Int = 120,
     val receiptBottomFeedLines: Int = 5,
+    val receiptTemplate: ReceiptTemplate = ReceiptTemplate(),
     val paymentQrUris: List<String> = emptyList(),
     val paymentQrTitles: List<String> = emptyList(),
     val deliveryWorkerUrl: String = "",
     val deliveryBoothId: String = "",
     val deliveryDeviceKey: String = "",
+    val accessCodeSharedKey: String = "",
 ) {
     val priceLabel: String
         get() = priceLabelForQuantity(1)
@@ -99,9 +115,12 @@ data class BoothConfiguration(
 
 data class StickerPlacement(
     val sticker: StickerId,
+    /** Receipt design coordinates in 576-dot width space, never UI-relative percentages. */
     val x: Float,
     val y: Float,
     val scale: Float = 1f,
+    /** Null retains the original glyph-based stickers from saved sessions. */
+    val artwork: StickerArtworkId? = null,
 )
 
 enum class StickerId(val label: String, val glyph: String) {
@@ -138,10 +157,21 @@ class LocalBoothConfigurationStore(context: Context) {
         preferences.edit().putString(CONFIGURATION_KEY, configurationToJson(configuration).toString()).apply()
     }
 
+    fun exportSafe(configuration: BoothConfiguration): String = configurationToJson(configuration)
+        .apply {
+            remove("deliveryDeviceKey")
+            remove("accessCodeSharedKey")
+        }
+        .toString()
+
+    fun importSafe(value: String, current: BoothConfiguration): BoothConfiguration =
+        configurationFromJson(value, current)
+
     private fun configurationToJson(configuration: BoothConfiguration) = JSONObject()
         .put("venueName", configuration.venueName)
         .put("header", configuration.header)
         .put("logoText", configuration.logoText)
+        .put("welcomeLogoPath", configuration.welcomeLogoPath)
         .put("footer", configuration.footer)
         .put("priceMinor", configuration.priceMinor)
         .put("currency", configuration.currency)
@@ -158,13 +188,15 @@ class LocalBoothConfigurationStore(context: Context) {
         .put("thermalPrintBrightness", configuration.thermalPrintBrightness)
         .put("thermalDitherThreshold", configuration.thermalDitherThreshold)
         .put("receiptBottomFeedLines", configuration.receiptBottomFeedLines)
+        .put("receiptTemplate", receiptTemplateToJson(configuration.receiptTemplate))
         .put("paymentQrUris", JSONArray(configuration.paymentQrUris))
         .put("paymentQrTitles", JSONArray(configuration.paymentQrTitles))
         .put("deliveryWorkerUrl", configuration.deliveryWorkerUrl)
         .put("deliveryBoothId", configuration.deliveryBoothId)
         .put("deliveryDeviceKey", configuration.deliveryDeviceKey)
+        .put("accessCodeSharedKey", configuration.accessCodeSharedKey)
 
-    private fun configurationFromJson(value: String): BoothConfiguration = runCatching {
+    private fun configurationFromJson(value: String, preserveSecrets: BoothConfiguration = BoothConfiguration()): BoothConfiguration = runCatching {
         val json = JSONObject(value)
         val legacyPrice = json.optInt("priceMinor", 2500).coerceAtLeast(0)
         fun readPrices(key: String): List<Int>? = json.optJSONArray(key)?.let { prices ->
@@ -181,6 +213,7 @@ class LocalBoothConfigurationStore(context: Context) {
             venueName = json.optString("venueName", "Your venue"),
             header = json.optString("header", "PHOTO MOMENT"),
             logoText = json.optString("logoText", "PB"),
+            welcomeLogoPath = json.optString("welcomeLogoPath", ""),
             footer = json.optString("footer", "Thanks for visiting"),
             priceMinor = legacyPrice,
             currency = json.optString("currency", "PHP"),
@@ -206,11 +239,13 @@ class LocalBoothConfigurationStore(context: Context) {
             ).coerceIn(0, 100),
             thermalDitherThreshold = json.optInt("thermalDitherThreshold", 120).coerceIn(80, 180),
             receiptBottomFeedLines = json.optInt("receiptBottomFeedLines", 5).coerceIn(2, 10),
+            receiptTemplate = receiptTemplateFromJson(json.optJSONObject("receiptTemplate")),
             paymentQrUris = json.optJSONArray("paymentQrUris")?.let { items -> buildList { for (index in 0 until items.length()) add(items.optString(index)) } } ?: emptyList(),
             paymentQrTitles = json.optJSONArray("paymentQrTitles")?.let { items -> buildList { for (index in 0 until items.length()) add(items.optString(index)) } } ?: emptyList(),
-            deliveryWorkerUrl = json.optString("deliveryWorkerUrl"),
-            deliveryBoothId = json.optString("deliveryBoothId"),
-            deliveryDeviceKey = json.optString("deliveryDeviceKey"),
+            deliveryWorkerUrl = json.optString("deliveryWorkerUrl", preserveSecrets.deliveryWorkerUrl),
+            deliveryBoothId = json.optString("deliveryBoothId", preserveSecrets.deliveryBoothId),
+            deliveryDeviceKey = json.optString("deliveryDeviceKey", preserveSecrets.deliveryDeviceKey),
+            accessCodeSharedKey = json.optString("accessCodeSharedKey", preserveSecrets.accessCodeSharedKey),
         )
     }.getOrElse { BoothConfiguration() }
 
@@ -219,6 +254,29 @@ class LocalBoothConfigurationStore(context: Context) {
         const val CONFIGURATION_KEY = "configuration"
     }
 }
+
+private fun receiptTemplateToJson(template: ReceiptTemplate) = JSONObject()
+    .put("title", template.title)
+    .put("primaryText", template.primaryText)
+    .put("secondaryText", template.secondaryText)
+    .put("postTotalText", template.postTotalText)
+    .put("noteLabel", template.noteLabel)
+    .put("noteText", template.noteText)
+    .put("barcodeCaption", template.barcodeCaption)
+    .put("logoUri", template.logoUri)
+
+private fun receiptTemplateFromJson(value: JSONObject?): ReceiptTemplate = ReceiptTemplate(
+    title = value?.optString("title", "RECEIPT")?.ifBlank { "RECEIPT" } ?: "RECEIPT",
+    primaryText = value?.optString("primaryText", "YOUR MOMENTS")?.let { text ->
+        if (text.equals("PHOTO MOMENT", ignoreCase = true)) "YOUR MOMENTS" else text
+    } ?: "YOUR MOMENTS",
+    secondaryText = value?.optString("secondaryText", "KEEP THE MEMORY") ?: "KEEP THE MEMORY",
+    postTotalText = value?.optString("postTotalText", "THANK YOU FOR VISITING") ?: "THANK YOU FOR VISITING",
+    noteLabel = value?.optString("noteLabel", "LEAVE A NOTE HERE:")?.ifBlank { "LEAVE A NOTE HERE:" } ?: "LEAVE A NOTE HERE:",
+    noteText = value?.optString("noteText", "") ?: "",
+    barcodeCaption = value?.optString("barcodeCaption", "THANK YOU!") ?: "THANK YOU!",
+    logoUri = value?.optString("logoUri", "") ?: "",
+)
 
 fun layoutDesignsToJson(designs: Map<LayoutId, LayoutDesign>) = JSONArray().apply {
     designs.forEach { (layoutId, design) ->

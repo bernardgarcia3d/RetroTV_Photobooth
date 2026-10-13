@@ -113,6 +113,15 @@ class UsbPrinterDiscovery(context: Context) {
         "Latest strip sent to XP-80TS."
     }
 
+    fun printXp80tsAccessCodes(deviceName: String, packageLabel: String, codes: List<String>): Result<String> = runCatching {
+        require(codes.isNotEmpty()) { "No access codes were generated." }
+        // Send one complete ESC/POS receipt per code so the printer cuts each voucher separately.
+        codes.forEach { code ->
+            sendToPrinter(deviceName, buildAccessCodeReceipt(packageLabel, listOf(code)))
+        }
+        "${codes.size} access code receipts printed."
+    }
+
     private fun sendToPrinter(deviceName: String, payload: ByteArray) {
         val device = usbManager.deviceList.values.firstOrNull { it.deviceName == deviceName }
             ?: error("USB printer is no longer connected.")
@@ -202,6 +211,25 @@ class UsbPrinterDiscovery(context: Context) {
             output.writeAscii("If you can read this,\n")
             output.writeAscii("the receipt printer path works.\n\n\n")
             output.write(byteArrayOf(0x1B, 0x64, 0x03))
+            output.write(byteArrayOf(0x1D, 0x56, 0x42, 0x00))
+            output.toByteArray()
+        }
+
+        private fun buildAccessCodeReceipt(packageLabel: String, codes: List<String>): ByteArray = ByteArrayOutputStream().use { output ->
+            output.write(byteArrayOf(0x1B, 0x40))
+            output.write(byteArrayOf(0x1B, 0x61, 0x01))
+            output.write(byteArrayOf(0x1D, 0x21, 0x11))
+            output.writeAscii("PHOTOBOOTH\n")
+            output.write(byteArrayOf(0x1D, 0x21, 0x00))
+            output.writeAscii("ACCESS CODES\n")
+            output.writeAscii("$packageLabel\n")
+            output.writeAscii("VALID TODAY UNTIL 11:59 PM\n")
+            output.writeAscii("------------------------\n")
+            codes.forEachIndexed { index, code ->
+                output.writeAscii("${index + 1}. $code\n")
+                output.writeAscii("------------------------\n")
+            }
+            output.writeAscii("Enter one code at the booth.\n\n\n")
             output.write(byteArrayOf(0x1D, 0x56, 0x42, 0x00))
             output.toByteArray()
         }

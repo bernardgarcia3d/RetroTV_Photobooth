@@ -13,3 +13,7 @@ releases/**/*.apk
 node_modules/
 output/
 .codex-remote-attachments/
+artifacts/
+tablet-*.png
+tmp-*.png
+supabase/.temp/

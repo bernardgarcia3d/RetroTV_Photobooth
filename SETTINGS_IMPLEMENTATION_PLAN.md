@@ -8,15 +8,16 @@ The goal is an operator-only control area that makes a cafe, restaurant, rental 
 
 ## Reference patterns worth adapting
 
-The recording groups controls into five practical areas:
+The released tablet UI groups controls into six practical areas:
 
-1. A setup checklist for printer, countdown, and receipt setup.
-2. Guest-experience controls for the home screen and available layouts.
-3. Capture-and-print controls for camera, timers, sounds, receipt design, printer width, and connectivity.
-4. Security and display controls, including a PIN and keeping the tablet awake.
-5. A QR delivery control that is only useful when a connected service has uploaded the media.
+1. **General:** venue and strip customization, the business PIN, delivery/provisioning status, and CRT/accessibility preferences.
+2. **Modes:** the three guest entry flows—Rental, Business, and Code access—and daily voucher management.
+3. **Business:** shared 1–10 print prices and guest payment QR images/titles.
+4. **Layout designs:** enabled strip layouts and their operator-defined names and visual presets.
+5. **Hardware:** USB printer connection, diagnostics, test prints, and thermal brightness/dither/feed tuning.
+6. **Print queue:** durable local print job status and retry actions.
 
-These categories match the product's local-first workflow. They must not let the app say that a printer or QR download is ready until it is actually ready.
+These categories match the product's local-first workflow. The screen uses a compact two-column tab control rather than a long mixed form, while preserving the same saved configuration and action handlers. It must not let the app say that a printer or QR download is ready until it is actually ready.
 
 ## Proposed information architecture
 
@@ -148,7 +149,8 @@ Persist local booth settings separately from event branding snapshots. Editing t
 
 1. Add reusable organizer branding profiles and frozen event snapshots.
 2. Add venue/rental/package deployment labels and print counters for reconciliation with the venue's own POS.
-3. Consider voucher or paid-print controls only after a deliberate payment-flow decision; in-app payments remain outside the current MVP.
+3. Code-based access is now available as an operator-selected mode: generate package-linked five-digit vouchers, print or reprint a batch, view remaining daily totals, cancel unused codes, and redeem them through the secure backend. In-app payments remain outside this voucher mode.
+4. Booth provisioning is owner-only. Cloudflare Worker/R2 credentials and the RetroRoll code-service key are masked, validated, hidden from normal Operator Settings, removable through a protected reset action, and excluded from safe configuration backups. Every booth ID must also exist in the active Supabase `photo_booths` registry before redeem, complete, or maintenance requests are accepted.
 
 ## Release 1 acceptance checks for settings
 
@@ -166,3 +168,16 @@ Persist local booth settings separately from event branding snapshots. Editing t
 - Build the XP-80T path before broadening printer support or building elaborate template controls.
 - Treat the QR workflow as a privacy-sensitive delivery system, not just a checkbox.
 - Use original branding and Compose components instead of copying the reference product's assets, layout, or copy.
+
+## Receipt template creator decision (2026-10-07)
+
+The old receipt-template controls mixed a border catalog with receipt copy fields, which made it unclear what would actually print. The operator experience now treats a receipt as a versioned document:
+
+- `Receipt Templates` is a library of built-in and custom templates, with preview, duplicate, default, enable, and delete actions.
+- `Create template` opens a print-scale 80 mm canvas with text, logo, image, line, spacer, photo-slot, and barcode elements.
+- Operators drag elements directly on the canvas, pinch to resize, edit text/tokens/font size in the inspector, and review the layer list before saving.
+- Built-in border artwork is protected; duplicating it creates an editable complete document.
+- A saved document is the sole render source for preview and print. The renderer does not add an invisible Classic receipt beneath it.
+- Completed sessions keep the selected template ID/version so later edits do not change historical output.
+- The editor uses the Operator Settings page's single vertical scroll container. A nested vertical scroller caused Compose to receive unbounded tablet height constraints and could close the app when Receipt Templates opened; that inner scroller was removed.
+- Border artwork and logos have explicit upload actions. Photo slots are layout-generated preview regions, with 1/3/4/6 controls, and the renderer uses the same region geometry for the selected guest layout.

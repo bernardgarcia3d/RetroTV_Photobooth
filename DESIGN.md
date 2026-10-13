@@ -35,6 +35,8 @@ Cream, green, and curtain red carry the interface. Cyan, magenta, purple, yellow
 - **Primary buttons:** Oxblood or forest fill, white text, minimum 52dp height, tactile pressed translation, no glow.
 - **Secondary buttons:** Thermal-paper fill with hardware-sand border and a clear label.
 - **Cards:** Warm white/thermal-paper fill, 1dp sand border, restrained elevation. Use elevation to separate a stage or QR surface, not as decoration.
+- **Control sizing:** Back and utility controls are at least 44dp; primary and form-completion actions are 52dp. QR tiles, camera windows, and printed-strip stages use fixed dimensions when their role is visual rather than flexible.
+- **Focus and selection:** Use Electric Cyan for the keyboard focus ring and the current border/template selection. Mint denotes an enabled or completed state; it does not replace the primary action color.
 - **Status pills:** Compact recessed labels with a colored dot or short machine prefix (`SYS OK`, `CRT: ON`, `WAITING FOR PAYMENT`).
 - **Logo mark:** Operator-configurable, rendered as a compact forest enamel badge while the venue and title remain editable configuration values.
 - **QR surface:** High-contrast thermal-paper card with generous quiet space, price, and instructions adjacent to it.
@@ -44,6 +46,8 @@ Cream, green, and curtain red carry the interface. Cyan, magenta, purple, yellow
 
 - Use a full-height, edge-to-edge kiosk canvas with safe touch padding.
 - Landscape tablets use an adaptive two-zone composition for title/payment content; portrait tablets collapse into a vertically scrollable single column.
+- Operator pages use a centered, bounded reading column (760–1120dp depending on complexity) rather than stretching controls across the entire tablet.
+- Long catalog rows may scroll horizontally inside their own rail; no guest or operator page may rely on horizontal page scrolling.
 - Keep all controls at least 44dp touch size and avoid horizontal scrolling.
 - Keep the title and payment layouts visually asymmetric when space allows: content on the left, QR/status surface on the right.
 - Preserve the camera-first attract experience and route activation through the branded title page before QR payment.
@@ -74,3 +78,10 @@ Cream, green, and curtain red carry the interface. Cyan, magenta, purple, yellow
 - No three equal generic cards when an asymmetric or compact feature treatment is clearer.
 - No invented branding that overrides operator settings.
 - No production claims for the demo QR; until a provider/backend is connected, label it as test/demo mode.
+## Implemented full-screen booth direction
+
+- The landing screen remains an edge-to-edge live camera experience.
+- Session, payment, layout, capture, review, delivery, completion, and operator pages use full-screen compositions rather than a simulated television cabinet.
+- Permanent decorative top and bottom rails are not part of the interface. Structure comes from spacing, typography, color blocks, and bounded content panels.
+- Landscape is the primary tablet layout. Narrow and portrait displays stack the same content without changing the underlying workflow.
+- The visual system uses the existing cream, sand, charcoal, forest, oxblood, mint, and cyan tokens. Existing components and all camera, QR, printing, and settings behavior remain authoritative.
