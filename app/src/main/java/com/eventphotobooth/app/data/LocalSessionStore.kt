@@ -77,6 +77,8 @@ class LocalSessionStore(context: Context) {
         .put("accessCodeId", session.accessCodeId)
         .put("accessCodePackageId", session.accessCodePackageId)
         .put("accessCodeBoothId", session.accessCodeBoothId)
+        .put("paymongoOrderId", session.paymongoOrderId)
+        .put("paymongoSessionId", session.paymongoSessionId)
 
     private fun sessionFromJson(value: JSONObject): LocalPhotoSession {
         val layoutId = value.optString("layoutId").let { raw ->
@@ -105,6 +107,8 @@ class LocalSessionStore(context: Context) {
             accessCodeId = value.optString("accessCodeId").takeIf { it.isNotBlank() },
             accessCodePackageId = value.optString("accessCodePackageId").takeIf { it.isNotBlank() },
             accessCodeBoothId = value.optString("accessCodeBoothId").takeIf { it.isNotBlank() },
+            paymongoOrderId = value.optString("paymongoOrderId").takeIf { it.isNotBlank() },
+            paymongoSessionId = value.optString("paymongoSessionId").takeIf { it.isNotBlank() },
         )
     }
 

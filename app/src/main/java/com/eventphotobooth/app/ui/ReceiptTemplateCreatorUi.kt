@@ -55,6 +55,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.eventphotobooth.app.data.LocalReceiptBorderTemplateStore
 import com.eventphotobooth.app.data.LayoutId
+import com.eventphotobooth.app.data.PhotoLayoutSpecs
 import com.eventphotobooth.app.data.ReceiptElement
 import com.eventphotobooth.app.data.ReceiptElementType
 import com.eventphotobooth.app.data.ReceiptTemplate
@@ -70,6 +71,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** Read-only catalog for the four artwork files shipped with the kiosk. */
+private data class TemplateCatalogStatus(
+    val text: String,
+    val layoutId: LayoutId? = null,
+    val isError: Boolean = false,
+)
+
 @Composable
 internal fun ReceiptTemplateCatalogPanel(
     store: LocalReceiptBorderTemplateStore,
@@ -79,7 +86,7 @@ internal fun ReceiptTemplateCatalogPanel(
     val scope = rememberCoroutineScope()
     var uploadLayout by remember { mutableStateOf<LayoutId?>(null) }
     var uploadName by remember { mutableStateOf("") }
-    var message by remember { mutableStateOf<String?>(null) }
+    var status by remember { mutableStateOf<TemplateCatalogStatus?>(null) }
     val uploadLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val layout = uploadLayout ?: return@rememberLauncherForActivityResult
         uri ?: return@rememberLauncherForActivityResult
@@ -95,9 +102,16 @@ internal fun ReceiptTemplateCatalogPanel(
             }.onSuccess { imported ->
                 onTemplatesChanged(store.load())
                 uploadName = ""
-                message = "${imported.name} was added to the ${layout.photoCount}-photo templates."
+                status = TemplateCatalogStatus(
+                    text = "${imported.name} was added to the ${layout.photoCount}-photo templates.",
+                    layoutId = layout,
+                )
             }.onFailure { error ->
-                message = error.message ?: "The selected template could not be opened."
+                status = TemplateCatalogStatus(
+                    text = error.message ?: "The selected template could not be opened.",
+                    layoutId = layout,
+                    isError = true,
+                )
             }
         }
     }
@@ -127,15 +141,18 @@ internal fun ReceiptTemplateCatalogPanel(
                 ElevatedButton(
                     onClick = {
                         onTemplatesChanged(store.restoreBundledTemplates())
-                        message = "Bundled templates restored for every layout."
+                        status = TemplateCatalogStatus("Bundled templates restored for every layout.")
                     },
                     modifier = Modifier.fillMaxWidth().height(48.dp),
                 ) { Text("Restore bundled templates") }
-                message?.let { Text(it, color = BoothPalette.mint, fontSize = 12.sp) }
+                status?.takeIf { it.layoutId == null }?.let {
+                    Text(it.text, color = BoothPalette.mint, fontSize = 12.sp)
+                }
             }
         }
         LayoutId.entries.forEach { layout ->
             val layoutTemplates = templates.filter { it.layoutId == layout }
+            val layoutCanvasHeight = PhotoLayoutSpecs.forLayout(layout).defaultCanvasHeight.toInt()
             Card(colors = CardDefaults.cardColors(BoothPalette.chrome)) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -152,6 +169,18 @@ internal fun ReceiptTemplateCatalogPanel(
                             modifier = Modifier.height(48.dp),
                         ) { Text("Upload template") }
                     }
+                    Text(
+                        "Artwork canvas: 576 × $layoutCanvasHeight px, or the same receipt proportion.",
+                        color = Color(0xFFD6E6DF),
+                        fontSize = 11.sp,
+                    )
+                    status?.takeIf { it.layoutId == layout }?.let {
+                        Text(
+                            it.text,
+                            color = if (it.isError) Color(0xFFFFB4AB) else BoothPalette.mint,
+                            fontSize = 12.sp,
+                        )
+                    }
                     if (layoutTemplates.isEmpty()) {
                         Text("No design uploaded for this layout.", color = Color(0xFFFFB4AB), fontSize = 12.sp)
                     } else {
@@ -162,7 +191,10 @@ internal fun ReceiptTemplateCatalogPanel(
                                     canDelete = layoutTemplates.count { it.enabled } > 1 && !template.isDefault,
                                     onSelect = {
                                         onTemplatesChanged(store.setDefaultForLayout(template.id, layout))
-                                        message = "${template.name} is now active for the ${layout.photoCount}-photo layout."
+                                        status = TemplateCatalogStatus(
+                                            text = "${template.name} is now active for the ${layout.photoCount}-photo layout.",
+                                            layoutId = layout,
+                                        )
                                     },
                                     onDelete = {
                                         val updated = if (template.source == com.eventphotobooth.app.data.ReceiptBorderSource.OPERATOR_CUSTOM) {
@@ -171,11 +203,14 @@ internal fun ReceiptTemplateCatalogPanel(
                                             store.update(template.copy(enabled = false, isDefault = false))
                                         }
                                         onTemplatesChanged(updated)
-                                        message = if (template.source == com.eventphotobooth.app.data.ReceiptBorderSource.OPERATOR_CUSTOM) {
-                                            "${template.name} was deleted from this tablet."
-                                        } else {
-                                            "${template.name} was disabled. Use Restore bundled templates to bring it back."
-                                        }
+                                        status = TemplateCatalogStatus(
+                                            text = if (template.source == com.eventphotobooth.app.data.ReceiptBorderSource.OPERATOR_CUSTOM) {
+                                                "${template.name} was deleted from this tablet."
+                                            } else {
+                                                "${template.name} was disabled. Use Restore bundled templates to bring it back."
+                                            },
+                                            layoutId = layout,
+                                        )
                                     },
                                 )
                             }

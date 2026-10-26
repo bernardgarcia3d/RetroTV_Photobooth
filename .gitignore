@@ -17,3 +17,7 @@ artifacts/
 tablet-*.png
 tmp-*.png
 supabase/.temp/
+supabase/functions/.env
+supabase/functions/.env.local
+supabase/functions/.env.paymongo
+supabase/functions/.env.paymongo.local

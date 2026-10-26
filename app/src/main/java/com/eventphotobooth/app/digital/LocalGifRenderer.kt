@@ -4,153 +4,131 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.ColorMatrix
-import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
-import android.graphics.Rect
 import android.graphics.RectF
-import com.eventphotobooth.app.data.BrandSnapshot
-import com.eventphotobooth.app.data.LayoutId
-import com.eventphotobooth.app.data.PhotoLayoutSpecs
+import android.media.MediaMetadataRetriever
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 
 class LocalGifRenderer {
-    fun renderAnimatedGifStrip(
-        sourcePhotos: List<File>,
+    /**
+     * Builds one animated version of the final branded strip. Every photo
+     * window plays its pre-flash clip in sync, then the final printed strip
+     * holds as the last loop frame.
+     */
+    fun renderBrandedTemplateGif(
+        clipFiles: List<File?>,
         finalStripFile: File,
-        brand: BrandSnapshot,
+        photoRegions: List<RectF>,
         outputFile: File,
-        layoutId: LayoutId,
-        guestPhotoBrightness: Int = 50,
     ): File {
-        require(sourcePhotos.isNotEmpty()) { "At least one source photo is required for GIF output." }
+        require(finalStripFile.isFile) { "The final print strip is not available for GIF output." }
+        require(photoRegions.isNotEmpty()) { "The selected template has no photo windows for GIF output." }
         val finalStrip = BitmapFactory.decodeFile(finalStripFile.absolutePath)
             ?: error("The final print strip could not be opened for GIF output.")
-
-        val targetWidth = 360
-        val targetHeight = (finalStrip.height * (targetWidth.toFloat() / finalStrip.width)).toInt()
-            .coerceIn(520, 920)
-        val frames = buildList {
-            sourcePhotos.forEachIndexed { index, photo ->
-                BitmapFactory.decodeFile(photo.absolutePath)?.let { source ->
-                    add(renderSourceFrame(source, brand, targetWidth, targetHeight, index + 1, sourcePhotos.size, layoutId, guestPhotoBrightness))
-                    source.recycle()
+        val clips = clipFiles.map { file -> file?.takeIf(File::isFile)?.let(::GifMomentSource) }
+        try {
+            val frames = buildList {
+                repeat(MOVING_FRAME_COUNT) { index ->
+                    val frame = finalStrip.copy(Bitmap.Config.ARGB_8888, true)
+                    val canvas = Canvas(frame)
+                    clips.forEachIndexed { photoIndex, clip ->
+                        val region = photoRegions.getOrNull(photoIndex) ?: return@forEachIndexed
+                        // Keep the static template's photo-frame edge visible
+                        // around the moving content.
+                        val movingTarget = RectF(region).apply { inset(2f, 2f) }
+                        clip?.frameAt((index + 1f) / (MOVING_FRAME_COUNT + 1f))?.let { movingPhoto ->
+                            try {
+                                canvas.drawBitmap(
+                                    movingPhoto,
+                                    centerCropRect(movingPhoto, movingTarget.width().toInt(), movingTarget.height().toInt()),
+                                    movingTarget,
+                                    Paint(Paint.FILTER_BITMAP_FLAG),
+                                )
+                            } finally {
+                                movingPhoto.recycle()
+                            }
+                        }
+                    }
+                    // Give the moving photo areas more palette space than the
+                    // mostly-white strip background. This keeps skin tones and
+                    // shadows smoother within GIF's 256-colour limit.
+                    add(GifFrame(frame, MOVING_FRAME_DELAY_CENTISECONDS, photoRegions))
                 }
+                add(GifFrame(finalStrip.copy(Bitmap.Config.ARGB_8888, false), FINAL_STILL_DELAY_CENTISECONDS))
             }
-            add(finalStrip.scaleToWidth(targetWidth, targetHeight))
+            try {
+                FileOutputStream(outputFile).use { stream ->
+                    GifWriter.write(finalStrip.width, finalStrip.height, frames, stream)
+                }
+            } finally {
+                frames.forEach { it.bitmap.recycle() }
+            }
+        } finally {
+            clips.forEach { it?.close() }
+            finalStrip.recycle()
         }
-        finalStrip.recycle()
-
-        FileOutputStream(outputFile).use { stream ->
-            GifWriter.write(
-                width = targetWidth,
-                height = targetHeight,
-                frames = frames,
-                output = stream,
-            )
-        }
-        frames.forEach(Bitmap::recycle)
         return outputFile
     }
 
-    private fun renderSourceFrame(
-        source: Bitmap,
-        brand: BrandSnapshot,
-        width: Int,
-        height: Int,
-        index: Int,
-        total: Int,
-        layoutId: LayoutId,
-        guestPhotoBrightness: Int,
-    ): Bitmap {
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        canvas.drawColor(Color.WHITE)
-
-        val accentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = brand.primaryColor.toInt() }
-        canvas.drawRect(0f, 0f, width.toFloat(), 10f, accentPaint)
-
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(20, 25, 27)
-            textAlign = Paint.Align.CENTER
-            typeface = android.graphics.Typeface.create(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD)
+    private fun centerCropRect(source: Bitmap, targetWidth: Int, targetHeight: Int): android.graphics.Rect {
+        val targetRatio = targetWidth.toFloat() / targetHeight
+        val sourceRatio = source.width.toFloat() / source.height
+        return if (sourceRatio > targetRatio) {
+            val cropWidth = (source.height * targetRatio).toInt().coerceAtMost(source.width)
+            val left = (source.width - cropWidth) / 2
+            android.graphics.Rect(left, 0, left + cropWidth, source.height)
+        } else {
+            val cropHeight = (source.width / targetRatio).toInt().coerceAtMost(source.height)
+            val top = (source.height - cropHeight) / 2
+            android.graphics.Rect(0, top, source.width, top + cropHeight)
         }
-        textPaint.textSize = 24f
-        canvas.drawText(brand.header.uppercase(), width / 2f, 46f, textPaint)
-        textPaint.typeface = android.graphics.Typeface.create(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.NORMAL)
-        textPaint.textSize = 14f
-        canvas.drawText("${brand.organizerName} · Photo $index of $total", width / 2f, 70f, textPaint)
-
-        val imageLeft = 18
-        val imageRight = width - 18
-        val imageWidth = imageRight - imageLeft
-        val availableImageHeight = height - 180
-        val imageHeight = (imageWidth / PhotoLayoutSpecs.forLayout(layoutId).photoAspectRatio)
-            .toInt()
-            .coerceAtMost(availableImageHeight)
-        val imageTop = 92 + ((availableImageHeight - imageHeight) / 2).coerceAtLeast(0)
-        val imageRect = Rect(imageLeft, imageTop, imageRight, imageTop + imageHeight)
-        drawCenterCrop(canvas, source, imageRect, guestPhotoBrightness)
-
-        textPaint.textSize = 13f
-        canvas.drawText(brand.footer, width / 2f, (height - 42).toFloat(), textPaint)
-        textPaint.textSize = 11f
-        canvas.drawText("KEEP THIS MOMENT", width / 2f, (height - 20).toFloat(), textPaint)
-        return bitmap
-    }
-
-    private fun Bitmap.scaleToWidth(targetWidth: Int, targetHeight: Int): Bitmap {
-        val scaled = Bitmap.createScaledBitmap(this, targetWidth, targetHeight, true)
-        val frame = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(frame)
-        canvas.drawColor(Color.WHITE)
-        canvas.drawBitmap(scaled, 0f, 0f, null)
-        if (scaled !== this) scaled.recycle()
-        return frame
-    }
-
-    private fun drawCenterCrop(canvas: Canvas, source: Bitmap, destination: Rect, guestPhotoBrightness: Int) {
-        val sourceRect = com.eventphotobooth.app.render.centerCropSourceRect(
-            source,
-            destination.width().toFloat() / destination.height().toFloat(),
-        )
-        val brightnessOffset = (guestPhotoBrightness.coerceIn(0, 100) - 50) * 2f
-        val matrix = ColorMatrix(
-            floatArrayOf(
-                1f, 0f, 0f, 0f, brightnessOffset,
-                0f, 1f, 0f, 0f, brightnessOffset,
-                0f, 0f, 1f, 0f, brightnessOffset,
-                0f, 0f, 0f, 1f, 0f,
-            ),
-        )
-        canvas.drawBitmap(
-            source,
-            sourceRect,
-            RectF(destination),
-            Paint(Paint.FILTER_BITMAP_FLAG).apply { colorFilter = ColorMatrixColorFilter(matrix) },
-        )
     }
 }
 
+private data class GifFrame(
+    val bitmap: Bitmap,
+    val delayCentiseconds: Int,
+    val prioritizedRegions: List<RectF> = emptyList(),
+)
+
+private class GifMomentSource(file: File) : AutoCloseable {
+    private val retriever = MediaMetadataRetriever().apply { setDataSource(file.absolutePath) }
+    private val durationMillis = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+        ?.toLongOrNull()?.coerceAtLeast(1L) ?: DEFAULT_GIF_MOMENT_DURATION_MILLIS
+
+    fun frameAt(fraction: Float): Bitmap? = runCatching {
+        retriever.getFrameAtTime(
+            (durationMillis * fraction.coerceIn(0f, 1f) * 1_000L).toLong(),
+            MediaMetadataRetriever.OPTION_CLOSEST,
+        )
+    }.getOrNull()
+
+    override fun close() = retriever.release()
+}
+
+// Eight evenly spaced frames keep the 1.2-second motion readable without
+// unnecessarily inflating the cloud-delivery download.
+private const val MOVING_FRAME_COUNT = 8
+private const val MOVING_FRAME_DELAY_CENTISECONDS = 15
+private const val FINAL_STILL_DELAY_CENTISECONDS = 100
+private const val DEFAULT_GIF_MOMENT_DURATION_MILLIS = 1_500L
+
 private object GifWriter {
-    fun write(width: Int, height: Int, frames: List<Bitmap>, output: FileOutputStream) {
+    fun write(width: Int, height: Int, frames: List<GifFrame>, output: FileOutputStream) {
         require(frames.isNotEmpty()) { "At least one GIF frame is required." }
         output.writeAscii("GIF89a")
         output.writeShort(width)
         output.writeShort(height)
-        output.write(0xF7)
+        // Each photo frame carries an adaptive local palette. A global fixed
+        // 3-3-2 palette was the cause of the dull, low-colour GIFs.
+        output.write(0x70)
         output.write(0x00)
         output.write(0x00)
-        repeat(256) { tone ->
-            output.write(tone)
-            output.write(tone)
-            output.write(tone)
-        }
         writeLoopExtension(output)
-        frames.forEachIndexed { index, bitmap ->
-            writeFrame(output, bitmap, delayCentiseconds = if (index == frames.lastIndex) 140 else 65)
+        frames.forEach { frame ->
+            writeFrame(output, frame)
         }
         output.write(0x3B)
     }
@@ -161,36 +139,171 @@ private object GifWriter {
         output.write(byteArrayOf(0x03, 0x01, 0x00, 0x00, 0x00))
     }
 
-    private fun writeFrame(output: FileOutputStream, bitmap: Bitmap, delayCentiseconds: Int) {
+    private fun writeFrame(output: FileOutputStream, frame: GifFrame) {
+        val bitmap = frame.bitmap
         output.write(byteArrayOf(0x21, 0xF9.toByte(), 0x04, 0x04))
-        output.writeShort(delayCentiseconds)
+        output.writeShort(frame.delayCentiseconds)
         output.write(byteArrayOf(0x00, 0x00))
         output.write(0x2C)
         output.writeShort(0)
         output.writeShort(0)
         output.writeShort(bitmap.width)
         output.writeShort(bitmap.height)
-        output.write(0x00)
+        output.write(0x87) // 256-entry local colour table
+        val palette = AdaptiveGifPalette.from(bitmap, frame.prioritizedRegions)
+        palette.writeTo(output)
         output.write(8)
-        output.writeSubBlocks(LzwEncoder.encode(bitmap.toGrayIndices()))
+        output.writeSubBlocks(LzwEncoder.encode(palette.indicesFor(bitmap)))
     }
+}
 
-    private fun Bitmap.toGrayIndices(): ByteArray {
-        val pixels = IntArray(width * height)
-        getPixels(pixels, 0, width, 0, 0, width, height)
-        return ByteArray(pixels.size) { index ->
-            val pixel = pixels[index]
-            val alpha = Color.alpha(pixel)
-            val red = blendOnWhite(Color.red(pixel), alpha)
-            val green = blendOnWhite(Color.green(pixel), alpha)
-            val blue = blendOnWhite(Color.blue(pixel), alpha)
-            (red * 0.299f + green * 0.587f + blue * 0.114f).toInt().coerceIn(0, 255).toByte()
+/**
+ * Per-frame adaptive 256-colour palette, using a 12-bit colour histogram.
+ * GIF cannot exceed 256 colours, so moving photo regions are weighted above
+ * the surrounding printed artwork and Floyd-Steinberg dithering softens the
+ * remaining colour transitions.
+ */
+private class AdaptiveGifPalette private constructor(
+    private val colors: IntArray,
+    private val binToPalette: IntArray,
+) {
+    fun writeTo(output: FileOutputStream) {
+        colors.forEach { color ->
+            output.write(Color.red(color))
+            output.write(Color.green(color))
+            output.write(Color.blue(color))
         }
     }
 
-    private fun blendOnWhite(value: Int, alpha: Int): Int =
-        ((value * alpha + 255 * (255 - alpha)) / 255).coerceIn(0, 255)
+    fun indicesFor(bitmap: Bitmap): ByteArray {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        val indices = ByteArray(pixels.size)
+        var currentErrors = FloatArray((bitmap.width + 2) * COLOR_COMPONENTS)
+        var nextErrors = FloatArray((bitmap.width + 2) * COLOR_COMPONENTS)
+
+        pixels.forEachIndexed { pixelIndex, pixel ->
+            val x = pixelIndex % bitmap.width
+            if (x == 0 && pixelIndex > 0) {
+                currentErrors = nextErrors
+                nextErrors = FloatArray((bitmap.width + 2) * COLOR_COMPONENTS)
+            }
+            val errorOffset = (x + 1) * COLOR_COMPONENTS
+            val alpha = Color.alpha(pixel)
+            val red = (blendOnWhite(Color.red(pixel), alpha) + currentErrors[errorOffset]).roundToChannel()
+            val green = (blendOnWhite(Color.green(pixel), alpha) + currentErrors[errorOffset + 1]).roundToChannel()
+            val blue = (blendOnWhite(Color.blue(pixel), alpha) + currentErrors[errorOffset + 2]).roundToChannel()
+            val paletteIndex = binToPalette[binFor(red, green, blue)]
+            indices[pixelIndex] = paletteIndex.toByte()
+            val paletteColor = colors[paletteIndex]
+            val redError = red - Color.red(paletteColor)
+            val greenError = green - Color.green(paletteColor)
+            val blueError = blue - Color.blue(paletteColor)
+            if (x < bitmap.width - 1) {
+                distributeError(currentErrors, errorOffset + COLOR_COMPONENTS, redError, greenError, blueError, 7f / 16f)
+            }
+            if (x > 0) {
+                distributeError(nextErrors, errorOffset - COLOR_COMPONENTS, redError, greenError, blueError, 3f / 16f)
+            }
+            distributeError(nextErrors, errorOffset, redError, greenError, blueError, 5f / 16f)
+            if (x < bitmap.width - 1) {
+                distributeError(nextErrors, errorOffset + COLOR_COMPONENTS, redError, greenError, blueError, 1f / 16f)
+            }
+        }
+        return indices
+    }
+
+    companion object {
+        fun from(bitmap: Bitmap, prioritizedRegions: List<RectF>): AdaptiveGifPalette {
+            val counts = IntArray(COLOR_BIN_COUNT)
+            val sumRed = LongArray(COLOR_BIN_COUNT)
+            val sumGreen = LongArray(COLOR_BIN_COUNT)
+            val sumBlue = LongArray(COLOR_BIN_COUNT)
+            val pixels = IntArray(bitmap.width * bitmap.height)
+            bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+            pixels.forEachIndexed { index, pixel ->
+                val bin = binFor(pixel)
+                val alpha = Color.alpha(pixel)
+                val red = blendOnWhite(Color.red(pixel), alpha)
+                val green = blendOnWhite(Color.green(pixel), alpha)
+                val blue = blendOnWhite(Color.blue(pixel), alpha)
+                val x = index % bitmap.width
+                val y = index / bitmap.width
+                val weight = if (prioritizedRegions.any { it.contains(x.toFloat(), y.toFloat()) }) {
+                    PHOTO_REGION_WEIGHT
+                } else {
+                    1
+                }
+                counts[bin] += weight
+                sumRed[bin] += red.toLong() * weight
+                sumGreen[bin] += green.toLong() * weight
+                sumBlue[bin] += blue.toLong() * weight
+            }
+            val selectedBins = counts.indices
+                .filter { counts[it] > 0 }
+                .sortedByDescending { counts[it] }
+                .take(PALETTE_SIZE)
+            val colors = IntArray(PALETTE_SIZE) { Color.WHITE }
+            selectedBins.forEachIndexed { index, bin ->
+                colors[index] = Color.rgb(
+                    (sumRed[bin] / counts[bin]).toInt(),
+                    (sumGreen[bin] / counts[bin]).toInt(),
+                    (sumBlue[bin] / counts[bin]).toInt(),
+                )
+            }
+            val binToPalette = IntArray(COLOR_BIN_COUNT)
+            counts.indices.forEach { bin ->
+                val representative = Color.rgb(
+                    ((bin shr 8) and 0x0F) * 17,
+                    ((bin shr 4) and 0x0F) * 17,
+                    (bin and 0x0F) * 17,
+                )
+                binToPalette[bin] = colors.indices.minByOrNull { paletteIndex ->
+                    colorDistance(representative, colors[paletteIndex])
+                } ?: 0
+            }
+            return AdaptiveGifPalette(colors, binToPalette)
+        }
+
+        private fun colorDistance(first: Int, second: Int): Int {
+            val red = Color.red(first) - Color.red(second)
+            val green = Color.green(first) - Color.green(second)
+            val blue = Color.blue(first) - Color.blue(second)
+            return red * red + green * green + blue * blue
+        }
+
+        private fun blendOnWhite(value: Int, alpha: Int): Int =
+            ((value * alpha + 255 * (255 - alpha)) / 255).coerceIn(0, 255)
+    }
 }
+
+private fun distributeError(
+    errors: FloatArray,
+    offset: Int,
+    red: Int,
+    green: Int,
+    blue: Int,
+    weight: Float,
+) {
+    errors[offset] += red * weight
+    errors[offset + 1] += green * weight
+    errors[offset + 2] += blue * weight
+}
+
+private fun Float.roundToChannel(): Int = toInt().coerceIn(0, 255)
+
+private const val PALETTE_SIZE = 256
+private const val COLOR_BIN_COUNT = 4_096
+private const val COLOR_COMPONENTS = 3
+private const val PHOTO_REGION_WEIGHT = 5
+
+private fun binFor(pixel: Int): Int =
+    binFor(Color.red(pixel), Color.green(pixel), Color.blue(pixel))
+
+private fun binFor(red: Int, green: Int, blue: Int): Int =
+    ((red ushr 4) shl 8) or
+        ((green ushr 4) shl 4) or
+        (blue ushr 4)
 
 private object LzwEncoder {
     fun encode(indices: ByteArray): ByteArray {
@@ -198,10 +311,10 @@ private object LzwEncoder {
         val clearCode = 256
         val endCode = 257
         val output = BitWriter()
-        // A clear code before every literal keeps the code width at 9 bits and
-        // avoids decoder differences around dictionary/code-width boundaries.
-        // The resulting GIF is larger, but remains broadly compatible with
-        // Android, browsers, Cloudflare previews, and mobile downloaders.
+        // Keep the simple, broadly compatible stream. Some mobile QR-browser
+        // viewers reject the dictionary-growing form of GIF LZW, even though
+        // desktop decoders accept it. File size is a trade-off; dependable
+        // guest downloads take priority.
         output.write(clearCode, 9)
         indices.forEach { pixel ->
             output.write(clearCode, 9)

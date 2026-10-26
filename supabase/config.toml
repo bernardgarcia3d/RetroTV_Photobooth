@@ -1,0 +1,5 @@
+# This function accepts PayMongo webhooks, which cannot carry a Supabase JWT.
+# It performs its own PayMongo signature verification before parsing or using
+# the body, and requires the booth shared key for kiosk-originated requests.
+[functions.paymongo-payments]
+verify_jwt = false

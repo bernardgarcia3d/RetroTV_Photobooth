@@ -16,9 +16,9 @@ enum class StickerSheet(
     val horizontalGap: Float,
     val verticalGap: Float,
 ) {
-    ROMANCE("sticker_sheet_romance", 4, 5, 0.03f, 0.03f, 0.21f, 0.19f, 0.035f, 0.01f),
-    EXPRESSIONS("sticker_sheet_expression", 5, 4, 0.02f, 0.14f, 0.18f, 0.17f, 0.02f, 0.03f),
-    RETRO("sticker_sheet_retro", 4, 5, 0.02f, 0.02f, 0.22f, 0.18f, 0.025f, 0.02f),
+    ROMANCE("sticker_sheet_romance_color", 4, 5, 0.03f, 0.03f, 0.21f, 0.19f, 0.035f, 0.01f),
+    EXPRESSIONS("sticker_sheet_expression_color", 5, 4, 0.02f, 0.14f, 0.18f, 0.17f, 0.02f, 0.03f),
+    RETRO("sticker_sheet_retro_color", 4, 5, 0.02f, 0.02f, 0.22f, 0.18f, 0.025f, 0.02f),
 }
 
 enum class StickerArtworkId(

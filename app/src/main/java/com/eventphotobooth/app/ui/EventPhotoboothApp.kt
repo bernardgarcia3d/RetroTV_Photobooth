@@ -10,6 +10,7 @@ import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.Bitmap.Config
 import android.media.AudioManager
 import android.media.MediaActionSound
@@ -116,7 +117,7 @@ import com.eventphotobooth.app.data.AccessCodeClient
 import com.eventphotobooth.app.data.GeneratedAccessBatch
 import com.eventphotobooth.app.data.RedeemedAccessCode
 import com.eventphotobooth.app.delivery.CloudDeliveryClient
-import com.eventphotobooth.app.delivery.DeliveryLinks
+import com.eventphotobooth.app.delivery.DeliveryUploadResult
 import com.eventphotobooth.app.data.BoothConfiguration
 import com.eventphotobooth.app.data.BoothOperationMode
 import com.eventphotobooth.app.digital.LocalGifRenderer
@@ -129,11 +130,16 @@ import com.eventphotobooth.app.data.LocalPhotoSession
 import com.eventphotobooth.app.data.LocalReceiptBorderTemplateStore
 import com.eventphotobooth.app.data.LocalSessionStore
 import com.eventphotobooth.app.data.OperatorPinStore
+import com.eventphotobooth.app.data.PaymongoAuthorizedSession
+import com.eventphotobooth.app.data.PaymongoPaymentClient
+import com.eventphotobooth.app.data.PaymongoPendingOrderStore
+import com.eventphotobooth.app.data.PendingPaymongoOrder
 import com.eventphotobooth.app.data.PrintJob
 import com.eventphotobooth.app.data.PrintStatus
 import com.eventphotobooth.app.data.ReceiptTemplate
 import com.eventphotobooth.app.data.ResponsiveBorderTemplate
 import com.eventphotobooth.app.data.asReceiptDocument
+import com.eventphotobooth.app.data.photoRegions
 import com.eventphotobooth.app.data.StickerId
 import com.eventphotobooth.app.data.StickerArtworkId
 import com.eventphotobooth.app.data.StickerPlacement
@@ -173,14 +179,24 @@ private sealed interface BoothScreen {
     data class BorderSelection(val photos: List<File>) : BoothScreen
     data class Stickers(val photos: List<File>) : BoothScreen
     data class Processing(val photos: List<File>, val layoutId: LayoutId) : BoothScreen
-    data class PrintingAnimation(val session: LocalPhotoSession, val printStatus: PrintStatus, val printMessage: String?, val deliveryLinks: DeliveryLinks? = null) : BoothScreen
-    data class Complete(val session: LocalPhotoSession, val printStatus: PrintStatus, val printMessage: String?, val deliveryLinks: DeliveryLinks? = null) : BoothScreen
-    data class DigitalDelivery(val session: LocalPhotoSession, val deliveryLinks: DeliveryLinks? = null) : BoothScreen
+    data class PrintingAnimation(val session: LocalPhotoSession, val printStatus: PrintStatus, val printMessage: String?) : BoothScreen
+    data class Complete(val session: LocalPhotoSession, val printStatus: PrintStatus, val printMessage: String?) : BoothScreen
+    data class DigitalDelivery(val session: LocalPhotoSession) : BoothScreen
     data object OperatorGate : BoothScreen
     data object OperatorSettings : BoothScreen
     data object ProvisioningSettings : BoothScreen
     data class Failure(val message: String) : BoothScreen
 }
+
+private data class ActiveDeliveryUpload(
+    val sessionId: String,
+    val result: DeliveryUploadResult? = null,
+)
+
+private data class CapturedMoments(
+    val photos: List<File>,
+    val clips: List<File?>,
+)
 
 @Composable
 fun EventPhotoboothApp() {
@@ -190,6 +206,7 @@ fun EventPhotoboothApp() {
     val configurationStore = remember { LocalBoothConfigurationStore(context.applicationContext) }
     val borderTemplateStore = remember { LocalReceiptBorderTemplateStore(context.applicationContext) }
     val pinStore = remember { OperatorPinStore(context.applicationContext) }
+    val paymongoPendingOrderStore = remember { PaymongoPendingOrderStore(context.applicationContext) }
     val printQueue = remember { LocalPrintQueue(sessionStore) }
     val printerDiscovery = remember { UsbPrinterDiscovery(context.applicationContext) }
     val renderer = remember { StripRenderer() }
@@ -238,11 +255,27 @@ fun EventPhotoboothApp() {
     val accessCodeClient = remember(configuration.accessCodeSharedKey, configuration.deliveryBoothId) {
         AccessCodeClient(BuildConfig.SUPABASE_URL, BuildConfig.SUPABASE_PUBLISHABLE_KEY, configuration.accessCodeSharedKey, configuration.deliveryBoothId.ifBlank { "booth-local" })
     }
+    val paymongoPaymentClient = remember(
+        configuration.accessCodeSharedKey,
+        configuration.deliveryBoothId,
+    ) {
+        PaymongoPaymentClient(
+            backendUrl = BuildConfig.PAYMONGO_BACKEND_URL,
+            publishableSupabaseKey = BuildConfig.SUPABASE_PUBLISHABLE_KEY,
+            boothSharedKey = configuration.accessCodeSharedKey,
+            boothId = configuration.deliveryBoothId,
+        )
+    }
     var printQuantity by remember { mutableStateOf(1) }
     var stickers by remember { mutableStateOf<List<StickerPlacement>>(emptyList()) }
     var guestBrightness by remember { mutableStateOf(50f) }
     var redeemedAccessCode by remember { mutableStateOf<RedeemedAccessCode?>(null) }
+    var pendingPaymongoOrder by remember { mutableStateOf(paymongoPendingOrderStore.load()) }
+    var activePaymongoSession by remember { mutableStateOf<PaymongoAuthorizedSession?>(null) }
     var screen by remember { mutableStateOf<BoothScreen>(BoothScreen.Welcome) }
+    var flashVisible by remember { mutableStateOf(false) }
+    var activeDeliveryUpload by remember { mutableStateOf<ActiveDeliveryUpload?>(null) }
+    var gifClipFiles by remember { mutableStateOf<List<File?>>(emptyList()) }
     var hasCameraPermission by remember {
         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
     }
@@ -263,25 +296,52 @@ fun EventPhotoboothApp() {
         } else {
             scope.launch {
                 runCatching {
-                    require(retakeIndex == null || retakeIndex in 0 until captureLayout.photoCount) {
+                    val captureCount = captureLayout.photoCount
+                    require(retakeIndex == null || retakeIndex in 0 until captureCount) {
                         "The selected photo is not part of this layout."
                     }
                     val sessionDirectory = existingPhotos.firstOrNull()?.parentFile
                         ?: File(context.filesDir, "sessions/${UUID.randomUUID()}").apply { mkdirs() }
-                    val workingPhotos = MutableList<File?>(captureLayout.photoCount) { index -> existingPhotos.getOrNull(index) }
-                    val indexesToCapture = retakeIndex?.let(::listOf) ?: (0 until captureLayout.photoCount).toList()
+                    val workingPhotos = MutableList<File?>(captureCount) { index -> existingPhotos.getOrNull(index) }
+                    val workingClips = MutableList<File?>(captureCount) { index -> gifClipFiles.getOrNull(index) }
+                    val indexesToCapture = retakeIndex?.let(::listOf) ?: (0 until captureCount).toList()
                     indexesToCapture.forEach { index ->
-                        for (seconds in COUNTDOWN_SECONDS downTo 1) {
-                            screen = BoothScreen.Countdown(captureLayout, seconds, index + 1, captureLayout.photoCount)
-                            countdownTone.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
+                        for (seconds in COUNTDOWN_SECONDS downTo 2) {
+                            screen = BoothScreen.Countdown(captureLayout, seconds, index + 1, captureCount)
+                            countdownTone.startTone(
+                                ToneGenerator.TONE_PROP_BEEP,
+                                150,
+                            )
                             delay(1_000)
                         }
+                        screen = BoothScreen.Countdown(captureLayout, 1, index + 1, captureCount)
+                        countdownTone.startTone(ToneGenerator.TONE_PROP_ACK, 220)
+                        workingClips[index] = runCatching {
+                            cameraController.recordGifMoment(File(sessionDirectory, "gif-moment-${index + 1}.mp4"), GIF_MOMENT_DURATION_MILLIS)
+                        }.getOrNull()
                         shutterSound.play(MediaActionSound.SHUTTER_CLICK)
-                        workingPhotos[index] = cameraController.capture(File(sessionDirectory, "source-${index + 1}.jpg"))
+                        flashVisible = true
+                        try {
+                            workingPhotos[index] = cameraController.capture(File(sessionDirectory, "source-${index + 1}.jpg"))
+                            // Keep the flash visible briefly so it is perceptible even when
+                            // CameraX finishes the file write almost immediately.
+                            delay(120)
+                        } finally {
+                            flashVisible = false
+                        }
                     }
-                    workingPhotos.map { requireNotNull(it) { "The capture session is incomplete." } }
-                }.onSuccess { photos -> screen = BoothScreen.Review(photos) }
-                    .onFailure { error -> screen = BoothScreen.Failure(error.message ?: "The camera could not capture this session.") }
+                    CapturedMoments(
+                        photos = workingPhotos.map { requireNotNull(it) { "The capture session is incomplete." } },
+                        clips = workingClips,
+                    )
+                }.onSuccess { captured ->
+                    flashVisible = false
+                    gifClipFiles = captured.clips
+                    screen = BoothScreen.Review(captured.photos)
+                }.onFailure { error ->
+                    flashVisible = false
+                    screen = BoothScreen.Failure(error.message ?: "The camera could not capture this session.")
+                }
             }
         }
     }
@@ -291,6 +351,10 @@ fun EventPhotoboothApp() {
         existingPhotos: List<File> = emptyList(),
         retakeIndex: Int? = null,
     ) {
+        if (existingPhotos.isEmpty()) {
+            deleteTemporaryGifClips(gifClipFiles)
+            gifClipFiles = emptyList()
+        }
         if (!hasCameraPermission) {
             permissionLauncher.launch(Manifest.permission.CAMERA)
         } else {
@@ -299,12 +363,16 @@ fun EventPhotoboothApp() {
     }
 
     val createPrintSession: (List<File>) -> Unit = { sourcePhotos ->
+        val gifClipsForSession = gifClipFiles
+        val authorizedPaymongoSession = activePaymongoSession
         scope.launch {
+            activeDeliveryUpload = null
             screen = BoothScreen.Processing(sourcePhotos, selectedLayout)
             runCatching {
                 withContext(Dispatchers.Default) {
-                    val sessionId = UUID.randomUUID().toString()
+                    val sessionId = authorizedPaymongoSession?.sessionId ?: UUID.randomUUID().toString()
                     val receiptTimestampMs = System.currentTimeMillis()
+                    val receiptNumber = sessionId.hashCode().toUInt().toString().takeLast(6).padStart(6, '0')
                     val outputDirectory = File(context.filesDir, "completed/$sessionId").apply { mkdirs() }
                     val printStrip = renderer.renderPrintStrip(
                         sourcePhotos = sourcePhotos,
@@ -313,22 +381,28 @@ fun EventPhotoboothApp() {
                         stickers = stickers,
                         outputFile = File(outputDirectory, "print-strip.png"),
                         receiptTemplate = configuration.receiptTemplate,
-                        receiptNumber = sessionId.hashCode().toUInt().toString().takeLast(6).padStart(6, '0'),
+                        receiptNumber = receiptNumber,
                         receiptTimestampMs = receiptTimestampMs,
-                        totalLabel = configuration.priceLabelForQuantity(printQuantity),
+                        totalLabel = authorizedPaymongoSession?.let { formatPaymongoAmount(it.amountMinor, it.currency) }
+                            ?: configuration.priceLabelForQuantity(printQuantity),
                         contentResolver = context.contentResolver,
                         layoutDesign = configuration.layoutDesign(selectedLayout),
                         guestPhotoBrightness = guestBrightness.roundToInt().coerceIn(0, 100),
                         borderTemplate = selectedReceiptDocumentTemplate,
                     )
-                    val animatedGif = gifRenderer.renderAnimatedGifStrip(
-                        sourcePhotos = sourcePhotos,
-                        finalStripFile = printStrip,
-                        brand = configuration.brandSnapshot(),
-                        outputFile = File(outputDirectory, "animated-gif-strip.gif"),
-                        layoutId = selectedLayout,
-                        guestPhotoBrightness = guestBrightness.roundToInt().coerceIn(0, 100),
-                    )
+                    val animatedGif = try {
+                        gifRenderer.renderBrandedTemplateGif(
+                            clipFiles = gifClipsForSession,
+                            finalStripFile = printStrip,
+                            photoRegions = selectedReceiptDocumentTemplate?.document
+                                ?.photoRegions(selectedLayout)
+                                ?.map { region -> RectF(region.x, region.y, region.x + region.width, region.y + region.height) }
+                                ?: defaultGifPhotoRegions(printStrip, selectedLayout),
+                            outputFile = File(outputDirectory, "animated-gif-strip.gif"),
+                        )
+                    } finally {
+                        deleteTemporaryGifClips(gifClipsForSession)
+                    }
                     galleryMediaExporter.export(
                         sessionId = sessionId,
                         photoFile = printStrip,
@@ -350,20 +424,34 @@ fun EventPhotoboothApp() {
                         accessCodeId = redeemedAccessCode?.accessCodeId,
                         accessCodePackageId = redeemedAccessCode?.packageId,
                         accessCodeBoothId = configuration.deliveryBoothId.ifBlank { "booth-local" },
+                        paymongoOrderId = authorizedPaymongoSession?.orderId,
+                        paymongoSessionId = authorizedPaymongoSession?.sessionId,
                     )
                 }
             }.onSuccess { session ->
-                val deliveryLinks = withContext(Dispatchers.IO) {
-                    deliveryClient.upload(configuration, session.id, File(session.digitalStripPath!!), File(session.animatedGifPath!!)).getOrNull()
-                }
                 sessionStore.saveSession(session)
                 val accessCode = redeemedAccessCode
-                if (accessCode != null && deliveryLinks != null) {
-                    accessCodeClient.complete(accessCode.accessCodeId, session.id)
-                        .onFailure { error -> println("Access code completion deferred: ${error.message}") }
+                activeDeliveryUpload = ActiveDeliveryUpload(session.id)
+                scope.launch {
+                    val deliveryResult = withContext(Dispatchers.IO) {
+                        deliveryClient.upload(configuration, session.id, File(session.digitalStripPath!!), File(session.animatedGifPath!!))
+                    }
+                    if (activeDeliveryUpload?.sessionId == session.id) {
+                        activeDeliveryUpload = ActiveDeliveryUpload(session.id, deliveryResult)
+                    }
+                    if (accessCode != null && deliveryResult.links != null) {
+                        withContext(Dispatchers.IO) {
+                            accessCodeClient.complete(accessCode.accessCodeId, session.id)
+                                .onFailure { error -> println("Access code completion deferred: ${error.message}") }
+                        }
+                    }
                 }
                 val printJob = printQueue.enqueue(session.id, session.printStripPath, session.printQuantity)
-                screen = BoothScreen.PrintingAnimation(session.copy(printStatus = PrintStatus.QUEUED), PrintStatus.QUEUED, if (deliveryLinks == null) "Printing your strip · cloud delivery unavailable" else "Preparing your strip", deliveryLinks)
+                screen = BoothScreen.PrintingAnimation(
+                    session.copy(printStatus = PrintStatus.QUEUED),
+                    PrintStatus.QUEUED,
+                    "Printing your strip · preparing digital copies",
+                )
                 // Let the physical-print animation complete and remain visible
                 // long enough for guests to understand what is happening.
                 delay(4_500)
@@ -372,7 +460,7 @@ fun EventPhotoboothApp() {
                     0 -> Result.failure(IllegalStateException("No USB printer with permission is available. The strip is queued for manual retry."))
                     1 -> {
                         val printingJob = printQueue.markPrinting(printJob)
-                        screen = BoothScreen.PrintingAnimation(session.copy(printStatus = PrintStatus.PRINTING), PrintStatus.PRINTING, "Printing your strip", deliveryLinks)
+                        screen = BoothScreen.PrintingAnimation(session.copy(printStatus = PrintStatus.PRINTING), PrintStatus.PRINTING, "Printing your strip")
                         runCatching {
                             withContext(Dispatchers.IO) {
                                 repeat(session.printQuantity) {
@@ -391,15 +479,30 @@ fun EventPhotoboothApp() {
                 }
                 printResult.onSuccess { printedJob ->
                     printQueue.markPrinted(printedJob)
+                    authorizedPaymongoSession?.takeIf { it.sessionId == session.id }?.let { paidSession ->
+                        scope.launch {
+                            withContext(Dispatchers.IO) {
+                                paymongoPaymentClient.completeSession(paidSession.orderId, paidSession.sessionId)
+                            }.onSuccess {
+                                paymongoPendingOrderStore.clear()
+                                pendingPaymongoOrder = null
+                                if (activePaymongoSession?.sessionId == paidSession.sessionId) {
+                                    activePaymongoSession = null
+                                }
+                            }.onFailure { error ->
+                                println("PayMongo session completion deferred: ${error.message}")
+                            }
+                        }
+                    }
                     scope.launch {
                         delay(600)
-                        screen = BoothScreen.DigitalDelivery(session.copy(printStatus = PrintStatus.PRINTED), deliveryLinks)
+                        screen = BoothScreen.DigitalDelivery(session.copy(printStatus = PrintStatus.PRINTED))
                     }
                 }.onFailure { error ->
                     val message = error.message ?: "Auto-print failed."
                     val latestJob = sessionStore.loadPrintJobs().firstOrNull { it.id == printJob.id } ?: printJob
                     printQueue.markFailed(latestJob, message)
-                    screen = BoothScreen.Complete(session.copy(printStatus = PrintStatus.FAILED), PrintStatus.FAILED, message, deliveryLinks)
+                    screen = BoothScreen.Complete(session.copy(printStatus = PrintStatus.FAILED), PrintStatus.FAILED, message)
                 }
             }.onFailure { error -> screen = BoothScreen.Failure(error.message ?: "The print strip could not be created.") }
         }
@@ -411,20 +514,68 @@ fun EventPhotoboothApp() {
             printQuantity = 1
             redeemedAccessCode = null
             selectedBorderTemplateId = activeBorderTemplates.firstOrNull { it.isDefault }?.id ?: activeBorderTemplates.firstOrNull()?.id
-            screen = when (configuration.operationMode) {
-                BoothOperationMode.RENTAL -> BoothScreen.LayoutSelection
-                BoothOperationMode.CODE_ACCESS -> BoothScreen.CodeAccess
-                BoothOperationMode.BUSINESS -> BoothScreen.Payment
+            screen = if (BuildConfig.PAYMENT_EDITION == "PAYMONGO") {
+                // This separate edition never falls through to Rental, code, or
+                // Business-PIN entry routes. A verified payment is its only
+                // guest capture authorization.
+                BoothScreen.Payment
+            } else {
+                when (configuration.operationMode) {
+                    BoothOperationMode.RENTAL -> BoothScreen.LayoutSelection
+                    BoothOperationMode.CODE_ACCESS -> BoothScreen.CodeAccess
+                    BoothOperationMode.BUSINESS -> BoothScreen.Payment
+                }
             }
         }, { screen = BoothScreen.Welcome }, { screen = BoothScreen.OperatorGate })
-        BoothScreen.Payment -> PaymentScreen(configuration, { quantity ->
-            printQuantity = quantity
-            screen = BoothScreen.BusinessPin(quantity)
-        }, { screen = BoothScreen.Welcome })
+        BoothScreen.Payment -> {
+            if (BuildConfig.PAYMENT_EDITION == "PAYMONGO") {
+                PaymongoCheckoutScreen(
+                    configuration = configuration,
+                    paymentClient = paymongoPaymentClient,
+                    pendingOrder = pendingPaymongoOrder,
+                    hasCameraPermission = hasCameraPermission,
+                    requestCameraPermission = { permissionLauncher.launch(Manifest.permission.CAMERA) },
+                    checkPrinter = {
+                        val printers = withContext(Dispatchers.IO) {
+                            printerDiscovery.discover().filter { it.hasPermission }
+                        }
+                        when (printers.size) {
+                            1 -> PaymongoPrinterReadiness(true, "Printer connected and USB permission granted. Confirm paper before charging a guest.")
+                            0 -> PaymongoPrinterReadiness(false, "Connect the receipt printer and grant USB permission before accepting payment.")
+                            else -> PaymongoPrinterReadiness(false, "More than one permitted USB printer is connected. Leave only the active receipt printer connected.")
+                        }
+                    },
+                    onPendingOrderChange = { updated ->
+                        pendingPaymongoOrder = updated
+                        if (updated == null) paymongoPendingOrderStore.clear() else paymongoPendingOrderStore.save(updated)
+                    },
+                    onPaymentAuthorized = { authorized ->
+                        activePaymongoSession = authorized
+                        printQuantity = authorized.printQuantity
+                        redeemedAccessCode = null
+                        stickers = emptyList()
+                        guestBrightness = 50f
+                        screen = BoothScreen.LayoutSelection
+                    },
+                    onBack = { screen = BoothScreen.Welcome },
+                )
+            } else {
+                PaymentScreen(configuration, { quantity ->
+                    printQuantity = quantity
+                    screen = BoothScreen.BusinessPin(quantity)
+                }, { screen = BoothScreen.Welcome })
+            }
+        }
         is BoothScreen.BusinessPin -> BusinessPinScreen(
             configuration = configuration,
             printQuantity = current.printQuantity,
-            onSuccess = { screen = BoothScreen.LayoutSelection },
+            onSuccess = {
+                if (BuildConfig.PAYMENT_EDITION == "PAYMONGO") {
+                    screen = BoothScreen.Failure("PayMongo checkout is not enabled yet. No session was activated.")
+                } else {
+                    screen = BoothScreen.LayoutSelection
+                }
+            },
             onBack = { screen = BoothScreen.Payment },
         )
         BoothScreen.CodeAccess -> AccessCodeScreen(
@@ -471,7 +622,7 @@ fun EventPhotoboothApp() {
             isRetake = current.retakeIndex != null,
             onStart = { beginCapture(current.layoutId, current.existingPhotos, current.retakeIndex) },
         )
-        is BoothScreen.Countdown -> CameraCaptureScreen(cameraController, current.layoutId, current.seconds, current.captureNumber, current.photoCount)
+        is BoothScreen.Countdown -> CameraCaptureScreen(cameraController, current.layoutId, current.seconds, current.captureNumber, current.photoCount, flashVisible)
         is BoothScreen.Review -> ReviewScreen(
             photos = current.photos,
             layoutId = selectedLayout,
@@ -497,7 +648,7 @@ fun EventPhotoboothApp() {
             borderTemplate = selectedReceiptDocumentTemplate,
             stickers = stickers,
             printQuantity = printQuantity,
-            allowPrintQuantityEditing = configuration.operationMode == BoothOperationMode.RENTAL,
+            allowPrintQuantityEditing = BuildConfig.PAYMENT_EDITION != "PAYMONGO" && configuration.operationMode == BoothOperationMode.RENTAL,
             onPrintQuantityChange = { printQuantity = it },
             guestBrightness = guestBrightness,
             onBrightnessChange = { guestBrightness = it },
@@ -515,7 +666,12 @@ fun EventPhotoboothApp() {
         )
         is BoothScreen.PrintingAnimation -> PrintingAnimationScreen(current.session, current.printStatus, current.printMessage)
         is BoothScreen.Complete -> CompleteScreen(current.session, current.printStatus, current.printMessage) { screen = BoothScreen.Welcome }
-        is BoothScreen.DigitalDelivery -> DigitalDeliveryScreen(current.session, current.deliveryLinks) { screen = BoothScreen.Welcome }
+        is BoothScreen.DigitalDelivery -> DigitalDeliveryScreen(
+            session = current.session,
+            deliveryResult = activeDeliveryUpload
+                ?.takeIf { it.sessionId == current.session.id }
+                ?.result,
+        ) { screen = BoothScreen.Welcome }
         BoothScreen.OperatorGate -> OperatorGateScreen(pinStore, { screen = BoothScreen.OperatorSettings }, { screen = BoothScreen.Welcome })
         BoothScreen.OperatorSettings -> OperatorSettingsScreen(
             configuration, sessionStore.loadSessions().size,
@@ -580,6 +736,25 @@ private fun WelcomeScreen(configuration: BoothConfiguration, hasCameraPermission
                 }
             }
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.BottomCenter) {
+                Box(
+                    modifier = Modifier
+                        .widthIn(max = 400.dp)
+                        .fillMaxWidth(0.95f)
+                        .aspectRatio(1.41f)
+                        .offset(y = (-18).dp)
+                        .align(Alignment.Center)
+                        .background(Color.Black.copy(alpha = 0.56f), RoundedCornerShape(20.dp))
+                        .border(1.dp, Color.White.copy(alpha = 0.18f), RoundedCornerShape(20.dp))
+                        .padding(12.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Image(
+                        painter = painterResource(id = com.eventphotobooth.app.R.drawable.test_moments_logo),
+                        contentDescription = "Test Moments logo",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
                 Button(onClick = onStart, colors = ButtonDefaults.buttonColors(containerColor = BoothPalette.oxblood, contentColor = Color.White), modifier = Modifier.padding(bottom = 34.dp).height(68.dp).width(270.dp)) {
                     Icon(Icons.Filled.CameraAlt, null); Text("  START SESSION", fontSize = 19.sp)
                 }
@@ -997,8 +1172,8 @@ private fun LandscapeTitleScreen(configuration: BoothConfiguration, cameraContro
                 Text(
                     configuration.header.uppercase(),
                     color = BoothPalette.forest,
-                    fontSize = 46.sp,
-                    lineHeight = 46.sp,
+                    fontSize = 34.sp,
+                    lineHeight = 36.sp,
                     fontWeight = androidx.compose.ui.text.font.FontWeight.Black,
                     letterSpacing = (-1.8).sp,
                     modifier = Modifier.padding(top = 16.dp).widthIn(max = 560.dp),
@@ -1123,6 +1298,91 @@ private fun CameraOutputCard(number: String, title: String, description: String,
                 Text(title, color = BoothPalette.ink, fontSize = 13.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
             }
             Text(description, color = BoothPalette.inkMuted, fontSize = 10.sp, modifier = Modifier.padding(top = 3.dp))
+        }
+    }
+}
+
+@Composable
+private fun PaymongoStagingCheckoutScreen(
+    configuration: BoothConfiguration,
+    onBack: () -> Unit,
+) {
+    val ownerMark = configuration.logoText.trim().ifBlank { "PB" }.take(4).uppercase()
+    val metrics = boothLayoutMetrics()
+    val backendMessage = if (BuildConfig.PAYMONGO_BACKEND_URL.isBlank()) {
+        "BACKEND NOT CONFIGURED"
+    } else {
+        "BACKEND CONFIGURED"
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BoothPalette.paper)
+            .padding(metrics.pagePadding)
+            .verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        PaymentHeader(ownerMark, configuration.venueName, onBack)
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 620.dp)
+                .padding(top = 32.dp * metrics.scale),
+            colors = CardDefaults.cardColors(BoothPalette.paperLight),
+            elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
+        ) {
+            Column(
+                modifier = Modifier.padding(28.dp * metrics.scale),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp * metrics.scale),
+            ) {
+                Text(
+                    "PAYMONGO QR PH",
+                    color = BoothPalette.forest,
+                    style = MaterialTheme.typography.headlineMedium,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    "STAGING CHECKOUT SHELL",
+                    color = BoothPalette.oxblood,
+                    fontSize = 12.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                    letterSpacing = 1.sp,
+                )
+                Text(
+                    "Dynamic QR payment is being prepared for this separate app edition.",
+                    color = BoothPalette.ink,
+                    style = MaterialTheme.typography.titleMedium,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    "No QR is displayed, no payment is requested, and camera capture remains locked until the secure payment backend is implemented and verified.",
+                    color = BoothPalette.inkMuted,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    "${BuildConfig.PAYMONGO_ENVIRONMENT}  •  $backendMessage",
+                    color = BoothPalette.forest,
+                    fontSize = 11.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                    modifier = Modifier
+                        .background(BoothPalette.paperPanel, RoundedCornerShape(4.dp))
+                        .border(1.dp, Color(0xFFD6CDBC), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                )
+                Button(
+                    onClick = {},
+                    enabled = false,
+                    modifier = Modifier.fillMaxWidth().height(54.dp),
+                ) {
+                    Text("PAYMENT CHECKOUT NOT YET ENABLED")
+                }
+                OutlinedButton(onClick = onBack, modifier = Modifier.fillMaxWidth().height(50.dp)) {
+                    Text("RETURN TO START")
+                }
+            }
         }
     }
 }
@@ -1616,12 +1876,13 @@ private fun CameraCaptureScreen(
     seconds: Int,
     captureNumber: Int,
     photoCount: Int,
+    flashVisible: Boolean,
 ) {
     val layoutSpec = com.eventphotobooth.app.data.PhotoLayoutSpecs.forLayout(layoutId)
     if (isLandscape()) {
-        LandscapeCameraCountdownScreen(cameraController, layoutSpec, seconds, captureNumber, photoCount)
+        LandscapeCameraCountdownScreen(cameraController, layoutSpec, seconds, captureNumber, photoCount, flashVisible)
     } else {
-        PortraitCameraCountdownScreen(cameraController, layoutSpec, seconds, captureNumber, photoCount)
+        PortraitCameraCountdownScreen(cameraController, layoutSpec, seconds, captureNumber, photoCount, flashVisible)
     }
 }
 
@@ -1693,6 +1954,7 @@ private fun LandscapeCameraReadyScreen(
                 )
                 Text(
                     if (isRetake) "Step into the frame. This replaces only this photo."
+                    else if (layoutSpec.layoutId == LayoutId.ONE_PHOTO) "Three moments make your GIF. The final flash becomes your print."
                     else "Step into the frame. Tap start when you are ready.",
                     color = BoothPalette.ink,
                     fontSize = 17.sp,
@@ -1709,7 +1971,8 @@ private fun LandscapeCameraReadyScreen(
                     Text("  START PHOTO", fontSize = 22.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Black, letterSpacing = 0.8.sp)
                 }
                 Text(
-                    "${photoCount} ${if (photoCount == 1) "photo" else "photos"}  ·  one keepsake",
+                    if (layoutSpec.layoutId == LayoutId.ONE_PHOTO) "3 GIF photos  ·  final photo prints"
+                    else "${photoCount} ${if (photoCount == 1) "photo" else "photos"}  ·  one keepsake",
                     color = BoothPalette.inkMuted,
                     fontSize = 14.sp,
                     letterSpacing = 0.7.sp,
@@ -1801,6 +2064,9 @@ private fun PortraitCameraReadyScreen(
         Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(BoothPalette.paperLight), shape = RoundedCornerShape(8.dp)) {
             Column(Modifier.padding(vertical = 14.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("TAP WHEN READY", color = BoothPalette.ink, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                if (!isRetake && layoutSpec.layoutId == LayoutId.ONE_PHOTO) {
+                    Text("3 GIF photos · final photo prints", color = BoothPalette.inkMuted, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+                }
                 CaptureStartButton(onStart, Modifier.padding(top = 10.dp))
             }
         }
@@ -1814,6 +2080,7 @@ private fun LandscapeCameraCountdownScreen(
     seconds: Int,
     captureNumber: Int,
     photoCount: Int,
+    flashVisible: Boolean,
 ) {
     BoxWithConstraints(Modifier.fillMaxSize().background(BoothPalette.paper)) {
         val previewPaneWidth = maxWidth * 0.62f
@@ -1832,6 +2099,7 @@ private fun LandscapeCameraCountdownScreen(
                 layoutSpec = layoutSpec,
                 captureNumber = captureNumber,
                 photoCount = photoCount,
+                flashVisible = flashVisible,
             )
         }
 
@@ -1861,6 +2129,7 @@ private fun PortraitCameraCountdownScreen(
     seconds: Int,
     captureNumber: Int,
     photoCount: Int,
+    flashVisible: Boolean,
 ) {
     Column(
         Modifier.fillMaxSize().background(BoothPalette.paper).padding(horizontal = 16.dp, vertical = 18.dp),
@@ -1872,6 +2141,7 @@ private fun PortraitCameraCountdownScreen(
                 layoutSpec = layoutSpec,
                 captureNumber = captureNumber,
                 photoCount = photoCount,
+                flashVisible = flashVisible,
             )
         }
         CountdownCopy(
@@ -1895,6 +2165,7 @@ private fun CountdownCameraPreviewWindow(
     layoutSpec: com.eventphotobooth.app.data.PhotoLayoutSpec,
     captureNumber: Int,
     photoCount: Int,
+    flashVisible: Boolean,
 ) {
     BoxWithConstraints(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         val previewModifier = if (maxWidth <= maxHeight * layoutSpec.photoAspectRatio) {
@@ -1926,6 +2197,13 @@ private fun CountdownCameraPreviewWindow(
             CaptureLookHereBadge(
                 modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 20.dp),
             )
+            if (flashVisible) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color.White),
+                )
+            }
         }
     }
 }
@@ -3197,13 +3475,20 @@ private fun CompleteScreen(session: LocalPhotoSession, printStatus: PrintStatus,
 }
 
 @Composable
-private fun DigitalDeliveryScreen(session: LocalPhotoSession, deliveryLinks: DeliveryLinks?, onDone: () -> Unit) {
+private fun DigitalDeliveryScreen(
+    session: LocalPhotoSession,
+    deliveryResult: DeliveryUploadResult?,
+    onDone: () -> Unit,
+) {
     LaunchedEffect(session.id) {
         delay(60_000)
         onDone()
     }
     val digitalStripReady = session.digitalStripPath?.let { File(it).exists() } == true
     val animatedGifReady = session.animatedGifPath?.let { File(it).exists() } == true
+    val deliveryLinks = deliveryResult?.links
+    val deliveryFailureMessage = deliveryResult?.failureMessage
+    val deliveryInProgress = deliveryResult == null
     BoxWithConstraints(Modifier.fillMaxSize().background(BoothPalette.paper)) {
         val landscape = maxWidth >= 700.dp
         val qrSize = if (landscape) 248.dp else 212.dp
@@ -3232,12 +3517,25 @@ private fun DigitalDeliveryScreen(session: LocalPhotoSession, deliveryLinks: Del
                 modifier = Modifier.padding(top = 2.dp),
             )
             Text(
-                if (deliveryLinks == null) "Your copies are saved safely on this tablet." else "Scan a code to download your photo strip or animated GIF.",
+                when {
+                    deliveryLinks != null -> "Scan a code to download your photo strip or animated GIF."
+                    deliveryInProgress -> "Preparing secure download links. Your copies are also saved on this tablet."
+                    else -> "Your copies are saved safely on this tablet."
+                },
                 color = BoothPalette.inkMuted,
                 style = MaterialTheme.typography.titleMedium,
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 modifier = Modifier.padding(top = 12.dp, bottom = 10.dp),
             )
+            if (deliveryLinks == null && deliveryFailureMessage != null) {
+                Text(
+                    deliveryFailureMessage,
+                    color = BoothPalette.oxblood,
+                    fontSize = 12.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier.padding(bottom = 2.dp),
+                )
+            }
 
             if (landscape) {
                 Row(
@@ -3250,19 +3548,19 @@ private fun DigitalDeliveryScreen(session: LocalPhotoSession, deliveryLinks: Del
                 ) {
                 DigitalQrCard(
                     title = "PHOTO STRIP",
-                    label = "LOCAL STRIP",
                     ready = digitalStripReady,
                     fileName = session.digitalStripPath?.let { File(it).name },
                     downloadUrl = deliveryLinks?.photoUrl,
+                    deliveryInProgress = deliveryInProgress,
                     qrSize = qrSize,
                     modifier = Modifier.width(cardWidth),
                 )
                 DigitalQrCard(
                     title = "ANIMATED GIF",
-                    label = "LOCAL GIF",
                     ready = animatedGifReady,
                     fileName = session.animatedGifPath?.let { File(it).name },
                     downloadUrl = deliveryLinks?.gifUrl,
+                    deliveryInProgress = deliveryInProgress,
                     qrSize = qrSize,
                     modifier = Modifier.width(cardWidth),
                 )
@@ -3278,19 +3576,19 @@ private fun DigitalDeliveryScreen(session: LocalPhotoSession, deliveryLinks: Del
                 ) {
                 DigitalQrCard(
                     title = "PHOTO STRIP",
-                    label = "LOCAL STRIP",
                     ready = digitalStripReady,
                     fileName = session.digitalStripPath?.let { File(it).name },
                     downloadUrl = deliveryLinks?.photoUrl,
+                    deliveryInProgress = deliveryInProgress,
                     qrSize = qrSize,
                     modifier = Modifier.width(cardWidth),
                 )
                 DigitalQrCard(
                     title = "ANIMATED GIF",
-                    label = "LOCAL GIF",
                     ready = animatedGifReady,
                     fileName = session.animatedGifPath?.let { File(it).name },
                     downloadUrl = deliveryLinks?.gifUrl,
+                    deliveryInProgress = deliveryInProgress,
                     qrSize = qrSize,
                     modifier = Modifier.width(cardWidth),
                 )
@@ -3310,10 +3608,10 @@ private fun DigitalDeliveryScreen(session: LocalPhotoSession, deliveryLinks: Del
 @Composable
 private fun DigitalQrCard(
     title: String,
-    label: String,
     ready: Boolean,
     fileName: String?,
     downloadUrl: String?,
+    deliveryInProgress: Boolean,
     qrSize: Dp,
     modifier: Modifier = Modifier.width(230.dp),
 ) {
@@ -3328,14 +3626,56 @@ private fun DigitalQrCard(
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(title, color = BoothPalette.forest, fontSize = 20.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Black, letterSpacing = 1.sp)
-        if (downloadUrl != null) {
-            DownloadQrTile(downloadUrl, Modifier.padding(top = 12.dp), qrSize)
-        } else {
-            DemoQrTile(Modifier.padding(top = 12.dp).size(qrSize), label)
+        when {
+            downloadUrl != null -> DownloadQrTile(downloadUrl, Modifier.padding(top = 12.dp), qrSize)
+            deliveryInProgress -> DeliveryStatusTile(
+                message = "PREPARING DOWNLOAD",
+                modifier = Modifier.padding(top = 12.dp).size(qrSize),
+                showProgress = true,
+            )
+            else -> DeliveryStatusTile(
+                message = "SAVED ON TABLET",
+                modifier = Modifier.padding(top = 12.dp).size(qrSize),
+                showProgress = false,
+            )
         }
-        Text(if (downloadUrl != null) "SCAN TO DOWNLOAD" else "AVAILABLE ON THIS TABLET", color = BoothPalette.forest, fontSize = 11.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold, letterSpacing = 0.8.sp, modifier = Modifier.padding(top = 12.dp))
+        Text(
+            when {
+                downloadUrl != null -> "SCAN TO DOWNLOAD"
+                deliveryInProgress -> "PREPARING SECURE LINK"
+                else -> "AVAILABLE ON THIS TABLET"
+            },
+            color = BoothPalette.forest,
+            fontSize = 11.sp,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+            letterSpacing = 0.8.sp,
+            modifier = Modifier.padding(top = 12.dp),
+        )
         Text(if (ready) "SAVED LOCALLY" else "PREPARING FILE", color = if (ready) BoothPalette.forestLight else BoothPalette.warmAccent, fontSize = 11.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold, modifier = Modifier.padding(top = 5.dp))
         fileName?.let { Text(it, color = BoothPalette.inkMuted, fontSize = 10.sp, maxLines = 1, modifier = Modifier.padding(top = 4.dp)) }
+        }
+    }
+}
+
+@Composable
+private fun DeliveryStatusTile(message: String, modifier: Modifier = Modifier, showProgress: Boolean) {
+    Card(modifier = modifier, colors = CardDefaults.cardColors(Color.White)) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            if (showProgress) {
+                CircularProgressIndicator(color = BoothPalette.forest, modifier = Modifier.size(42.dp))
+            }
+            Text(
+                message,
+                color = BoothPalette.forest,
+                fontSize = 13.sp,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                modifier = Modifier.padding(top = if (showProgress) 16.dp else 0.dp),
+            )
         }
     }
 }
@@ -4653,6 +4993,31 @@ private fun CameraPreview(controller: CameraCaptureController, modifier: Modifie
 }
 
 private const val COUNTDOWN_SECONDS = 5
+private const val GIF_MOMENT_DURATION_MILLIS = 1_500L
+
+private fun deleteTemporaryGifClips(clips: List<File?>) {
+    clips.forEach { clip ->
+        runCatching { clip?.takeIf(File::isFile)?.delete() }
+    }
+}
+
+private fun defaultGifPhotoRegions(printStrip: File, layoutId: LayoutId): List<RectF> {
+    val scale = BitmapFactory.decodeFile(printStrip.absolutePath)?.let { bitmap ->
+        try {
+            bitmap.width / 576f to bitmap.height.toFloat()
+        } finally {
+            bitmap.recycle()
+        }
+    } ?: return emptyList()
+    val headerHeight = 360f * scale.first
+    val footerHeight = 500f * scale.first
+    val left = 18f * scale.first
+    val width = 540f * scale.first
+    val height = (scale.second - headerHeight - footerHeight).coerceAtLeast(40f)
+    return PhotoLayoutSpecs.forLayout(layoutId)
+        .photoRegions(left, headerHeight, width, height, 12f * scale.first)
+        .map { region -> RectF(region.x, region.y, region.x + region.width, region.y + region.height) }
+}
 
 @Composable
 internal fun isLandscape(): Boolean = LocalConfiguration.current.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE

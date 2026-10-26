@@ -12,6 +12,13 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.FallbackStrategy
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.core.content.ContextCompat
 import androidx.exifinterface.media.ExifInterface
 import androidx.lifecycle.LifecycleOwner
@@ -27,6 +34,7 @@ class CameraCaptureController(
 ) {
     private val cameraExecutor: Executor = ContextCompat.getMainExecutor(context)
     private var imageCapture: ImageCapture? = null
+    private var videoCapture: VideoCapture<Recorder>? = null
 
     suspend fun bindPreview(previewView: PreviewView, lifecycleOwner: LifecycleOwner) {
         val provider = context.cameraProvider()
@@ -45,6 +53,17 @@ class CameraCaptureController(
             .setTargetRotation(rotation)
             .setTargetAspectRatio(AspectRatio.RATIO_4_3)
             .build()
+        val recorder = Recorder.Builder()
+            // HD improves the source frames, while a fallback keeps GIF capture
+            // working on tablets that cannot offer this profile.
+            .setQualitySelector(
+                QualitySelector.from(
+                    Quality.HD,
+                    FallbackStrategy.lowerQualityOrHigherThan(Quality.HD),
+                ),
+            )
+            .build()
+        videoCapture = VideoCapture.withOutput(recorder)
 
         provider.unbindAll()
         provider.bindToLifecycle(
@@ -52,6 +71,7 @@ class CameraCaptureController(
             CameraSelector.DEFAULT_FRONT_CAMERA,
             preview,
             requireNotNull(imageCapture),
+            requireNotNull(videoCapture),
         )
     }
 
@@ -77,9 +97,39 @@ class CameraCaptureController(
         }
     }
 
+    /** Records the short moving moment immediately before the still-photo flash. */
+    suspend fun recordGifMoment(target: File, durationMillis: Long): File {
+        require(durationMillis > 0) { "GIF moment duration must be positive" }
+        val capture = checkNotNull(videoCapture) { "Camera video is not ready" }
+        target.parentFile?.mkdirs()
+        return suspendCancellableCoroutine { continuation ->
+            val recording = capture.output
+                .prepareRecording(context, FileOutputOptions.Builder(target).build())
+                .start(cameraExecutor) { event ->
+                    if (event is VideoRecordEvent.Finalize && continuation.isActive) {
+                        if (event.hasError()) {
+                            continuation.resumeWithException(
+                                IllegalStateException("Unable to record the GIF moment: ${event.error}"),
+                            )
+                        } else {
+                            continuation.resume(target)
+                        }
+                    }
+                }
+            val stopRecording = Runnable { recording.stop() }
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(stopRecording, durationMillis)
+            continuation.invokeOnCancellation {
+                android.os.Handler(android.os.Looper.getMainLooper()).removeCallbacks(stopRecording)
+                recording.stop()
+                target.delete()
+            }
+        }
+    }
+
     fun release() {
         ProcessCameraProvider.getInstance(context).get().unbindAll()
         imageCapture = null
+        videoCapture = null
     }
 
     /**

@@ -41,6 +41,24 @@ The Samsung tablet has detected one connected USB device with the XP-D4601B deve
 4. Grant camera permission.
 5. Use the XP-D4601B only for USB discovery, permission, diagnostic label, and scaled strip-proof testing. Complete receipt-strip printing against a USB-equipped XP-80T.
 
+## Android editions
+
+The project now has two installable Android editions:
+
+- `standardDebug`: the existing RetroTV PhotoBooth package, `com.eventphotobooth.app`.
+- `paymongoDebug`: the separate RetroTV PhotoBooth PayMongo staging package, `com.eventphotobooth.app.paymongo`.
+
+Build either edition with:
+
+```powershell
+.\gradlew.bat :app:assembleStandardDebug
+.\gradlew.bat :app:assemblePaymongoDebug
+```
+
+The PayMongo edition now contains the Phase 4 staging checkout: it checks camera, printer permission, and the payment backend; gets the server-confirmed price; displays a single-use QR Ph code; and starts camera capture only after the server verifies payment and grants a one-time session. It cannot fall through to Rental, code, or Business-PIN entry routes. A payment backend URL is supplied only at build time with `-PpaymongoStagingBackendUrl=<https-url>`; it is not a merchant secret. The function, migration, secrets, price tiers, and test webhook must be deployed before the checkout can accept a test payment.
+
+Never add a PayMongo secret key or webhook secret to the Android project. The backend reads those values from its secret environment only. A safe variable-name template is included in `supabase/functions/.env.paymongo.example`, and the staging setup procedure is in `PAYMONGO_PHASE_3_RUNBOOK.md` and `PAYMONGO_PHASE_4_STAGING_CHECKLIST.md`.
+
 ## Fallback release
 
 The current baseline is preserved as RetroTV PhotoBooth `v1.0.0`.
@@ -54,4 +72,4 @@ Future work should continue on `master` (or a feature branch) without moving the
 
 ## Production boundary
 
-The app deliberately does not create a live payment request, verify a QRPH payment, upload media, issue signed URLs, or claim cloud delivery is available. The displayed payment and delivery QR tiles are local MVP test aids only. Live payment requires a provider-neutral backend webhook/status flow; production digital delivery requires the private storage and signed-token backend defined in the PRD.
+The standard app deliberately does not create or verify a PayMongo payment. The separate PayMongo build is staging-only until its backend, webhook, and physical-tablet checks pass. Production digital delivery still requires the private storage and signed-token backend defined in the PRD.

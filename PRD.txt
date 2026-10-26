@@ -506,11 +506,12 @@ All backend IDs use UUIDs. Raw payment tokens, guest bearer tokens, and permanen
 
 ### Release 3: digital delivery and gallery (partially implemented)
 
-- Implemented: local GIF and digital-strip rendering.
+- Implemented: local GIF and digital-strip rendering. During the final countdown second for every photo window, the tablet records a 1.5-second HD-preferred local video moment before taking the high-quality flash still used for print. The branded GIF keeps the complete selected strip template visible, plays all its photo-window clips in sync for 1.2 seconds, and then holds the final printed stills. The GIF and digital photo-strip remain separate downloads. Source MP4 clips are deleted after GIF composition and are never uploaded; only the final PNG strip and GIF are exported and delivered.
 - Implemented: optional booth-authenticated Cloudflare Worker/R2 upload.
 - Implemented: separate opaque, one-hour download links for GIF and digital strip.
+- Implemented: three bounded retries with a 90-second response window for larger GIF uploads, plus a non-sensitive kiosk failure reason when cloud delivery remains unavailable.
 - Implemented: local fallback when cloud delivery is not configured or unavailable.
-- Remaining: durable upload retry state, operator gallery, event scoping in a backend data model, revocation/deletion controls, and production retention jobs.
+- Remaining: durable upload retry after app restart or a later network reconnection, operator gallery, event scoping in a backend data model, revocation/deletion controls, and production retention jobs.
 - Add private event gallery, expiry, revocation, and deletion.
 - Add operator metrics and event export.
 

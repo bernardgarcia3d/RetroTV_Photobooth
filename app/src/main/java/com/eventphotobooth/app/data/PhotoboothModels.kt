@@ -45,6 +45,9 @@ data class LocalPhotoSession(
     val accessCodeId: String? = null,
     val accessCodePackageId: String? = null,
     val accessCodeBoothId: String? = null,
+    /** Server-verified payment references, never PayMongo merchant credentials. */
+    val paymongoOrderId: String? = null,
+    val paymongoSessionId: String? = null,
 )
 
 data class PrintJob(
