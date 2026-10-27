@@ -2,6 +2,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import {
   parsePaymongoWebhookEvent,
+  safeEqual,
   sha256Hex,
   verifyPaymongoWebhookSignature,
 } from "./payment-utils.ts";
@@ -41,6 +42,10 @@ type PaymentConfig = {
   apiBaseUrl: string;
   webhookToleranceSeconds: number;
   sessionGrantTtlSeconds: number;
+};
+type BoothCredential = {
+  id: string;
+  booth_id: string;
 };
 
 class HttpError extends Error {
@@ -149,6 +154,72 @@ async function validateBooth(client: ReturnType<typeof createClient>, boothId: s
     .maybeSingle();
   if (error) throw error;
   if (!data) throw new HttpError(403, "Booth is not registered or is disabled");
+}
+
+/**
+ * A dedicated credential is required for operator price administration. The
+ * legacy shared key remains accepted for the existing checkout protocol while
+ * already-provisioned kiosks are migrated, but it cannot edit prices.
+ */
+async function authenticateBooth(
+  client: ReturnType<typeof createClient>,
+  boothId: string,
+  suppliedKey: string | null,
+  requireDedicatedCredential = false,
+): Promise<BoothCredential | null> {
+  await validateBooth(client, boothId);
+  if (!suppliedKey || suppliedKey.length < 16) throw new HttpError(401, "Unauthorized booth");
+  const suppliedHash = await sha256Hex(suppliedKey);
+  const { data, error } = await client.from("photo_payment_booth_credentials")
+    .select("id, booth_id")
+    .eq("booth_id", boothId)
+    .eq("device_key_sha256", suppliedHash)
+    .eq("active", true)
+    .maybeSingle();
+  if (error) throw error;
+  if (data) return data as BoothCredential;
+
+  if (!requireDedicatedCredential) {
+    const legacyKey = Deno.env.get("BOOTH_SHARED_KEY");
+    if (legacyKey && safeEqual(legacyKey, suppliedKey)) return null;
+  }
+  throw new HttpError(401, requireDedicatedCredential
+    ? "This tablet has not been provisioned for operator pricing"
+    : "Unauthorized booth");
+}
+
+async function activePriceTiers(client: ReturnType<typeof createClient>, boothId: string) {
+  const { data, error } = await client.from("photo_payment_price_tiers")
+    .select("print_quantity, amount_minor, currency, version")
+    .eq("booth_id", boothId)
+    .eq("active", true)
+    .order("print_quantity", { ascending: true });
+  if (error) throw error;
+  return (data ?? []).map((tier) => ({
+    printQuantity: tier.print_quantity,
+    amountMinor: tier.amount_minor,
+    currency: tier.currency,
+    version: tier.version,
+  }));
+}
+
+function priceTiersFromRequest(value: unknown) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 10) {
+    throw new HttpError(400, "Between one and ten price tiers are required");
+  }
+  const seen = new Set<number>();
+  return value.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new HttpError(400, "Invalid price tier");
+    const record = item as Record<string, unknown>;
+    const printQuantity = Number(record.printQuantity);
+    const amountMinor = Number(record.amountMinor);
+    if (!Number.isInteger(printQuantity) || printQuantity < 1 || printQuantity > 10 ||
+      !Number.isInteger(amountMinor) || amountMinor < 100 || amountMinor > 2_000_000 || seen.has(printQuantity)) {
+      throw new HttpError(400, "Invalid price tier");
+    }
+    seen.add(printQuantity);
+    return { printQuantity, amountMinor };
+  }).sort((left, right) => left.printQuantity - right.printQuantity);
 }
 
 async function paymongoRequest(config: PaymentConfig, path: string, init: RequestInit) {
@@ -557,8 +628,6 @@ Deno.serve(async (request) => {
     }
   }
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
-  const sharedKey = Deno.env.get("BOOTH_SHARED_KEY");
-  if (!sharedKey || request.headers.get("x-booth-key") !== sharedKey) return json({ error: "Unauthorized booth" }, 401);
 
   try {
     const declaredLength = Number(request.headers.get("content-length") ?? "0");
@@ -574,11 +643,32 @@ Deno.serve(async (request) => {
       throw new HttpError(400, "Invalid request body");
     }
     const action = requiredString(body.action, "Action");
+    const boothId = requiredString(body.boothId, "Booth ID");
+    const credential = await authenticateBooth(client, boothId, request.headers.get("x-booth-key"), action === "replace_prices");
     if (action === "health") return json({ ok: true, paymentConfigured: paymentConfigured() });
 
+    if (action === "list_prices") {
+      return json({ boothId, tiers: await activePriceTiers(client, boothId) });
+    }
+    if (action === "replace_prices") {
+      if (!credential) throw new HttpError(401, "This tablet has not been provisioned for operator pricing");
+      const tiers = priceTiersFromRequest(body.tiers);
+      const { data, error } = await client.rpc("replace_photo_payment_price_tiers", {
+        p_booth_id: boothId,
+        p_credential_id: credential.id,
+        p_tiers: tiers.map((tier) => ({ print_quantity: tier.printQuantity, amount_minor: tier.amountMinor })),
+      });
+      if (error) throw error;
+      const result = Array.isArray(data) ? data[0] : null;
+      if (!result) throw new HttpError(500, "Price update failed");
+      return json({
+        boothId,
+        priceVersion: result.price_version,
+        tiers: await activePriceTiers(client, boothId),
+      });
+    }
+
     const config = paymentConfig();
-    const boothId = requiredString(body.boothId, "Booth ID");
-    await validateBooth(client, boothId);
 
     if (action === "create_order") {
       const requestId = requiredString(body.requestId, "Request ID");
@@ -614,3 +704,4 @@ Deno.serve(async (request) => {
     return json({ error: "Payment service failed" }, 500);
   }
 });
+

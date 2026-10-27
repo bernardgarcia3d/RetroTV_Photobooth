@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import org.json.JSONArray
 
 /**
  * Android-side portion of the PayMongo QR Ph flow.
@@ -54,6 +55,13 @@ data class PaymongoQrCode(
     fun decodeBitmap(): Bitmap? = decodePaymongoQrImage(imageData)
 }
 
+data class PaymongoPriceTier(
+    val printQuantity: Int,
+    val amountMinor: Int,
+    val currency: String = "PHP",
+    val version: Int? = null,
+)
+
 class PaymongoPaymentClient(
     private val backendUrl: String,
     private val publishableSupabaseKey: String,
@@ -71,8 +79,55 @@ class PaymongoPaymentClient(
         else -> null
     }
 
-    suspend fun health(): Result<Boolean> = callBackend(JSONObject().put("action", "health")).map {
+    suspend fun health(): Result<Boolean> = callBackend(
+        JSONObject().put("action", "health").put("boothId", boothId),
+    ).map {
         it.optBoolean("ok", false) && it.optBoolean("paymentConfigured", false)
+    }
+
+    suspend fun priceTiers(): Result<List<PaymongoPriceTier>> = callBackend(
+        JSONObject().put("action", "list_prices").put("boothId", boothId),
+    ).map { response ->
+        val tiers = response.optJSONArray("tiers") ?: JSONArray()
+        buildList {
+            for (index in 0 until tiers.length()) {
+                val tier = tiers.getJSONObject(index)
+                add(
+                    PaymongoPriceTier(
+                        printQuantity = tier.getInt("printQuantity"),
+                        amountMinor = tier.getInt("amountMinor"),
+                        currency = tier.optString("currency", "PHP"),
+                        version = tier.optInt("version", 0).takeIf { it > 0 },
+                    ),
+                )
+            }
+        }
+    }
+
+    suspend fun replacePriceTiers(tiers: List<PaymongoPriceTier>): Result<List<PaymongoPriceTier>> = callBackend(
+        JSONObject()
+            .put("action", "replace_prices")
+            .put("boothId", boothId)
+            .put("tiers", JSONArray().apply {
+                tiers.sortedBy { it.printQuantity }.forEach { tier ->
+                    put(JSONObject().put("printQuantity", tier.printQuantity).put("amountMinor", tier.amountMinor))
+                }
+            }),
+    ).map { response ->
+        val returned = response.optJSONArray("tiers") ?: JSONArray()
+        buildList {
+            for (index in 0 until returned.length()) {
+                val tier = returned.getJSONObject(index)
+                add(
+                    PaymongoPriceTier(
+                        printQuantity = tier.getInt("printQuantity"),
+                        amountMinor = tier.getInt("amountMinor"),
+                        currency = tier.optString("currency", "PHP"),
+                        version = tier.optInt("version", 0).takeIf { it > 0 },
+                    ),
+                )
+            }
+        }
     }
 
     suspend fun createOrder(printQuantity: Int, requestId: String): Result<PaymongoCheckout> = callBackend(
@@ -230,3 +285,4 @@ fun decodePaymongoQrImage(value: String): Bitmap? = runCatching {
     val bytes = Base64.decode(encoded, Base64.DEFAULT)
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 }.getOrNull()
+

@@ -28,11 +28,13 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -42,14 +44,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.text.KeyboardOptions
 import com.eventphotobooth.app.BuildConfig
 import com.eventphotobooth.app.data.BoothConfiguration
 import com.eventphotobooth.app.data.PaymongoAuthorizedSession
 import com.eventphotobooth.app.data.PaymongoCheckout
 import com.eventphotobooth.app.data.PaymongoPaymentClient
+import com.eventphotobooth.app.data.PaymongoPriceTier
 import com.eventphotobooth.app.data.PendingPaymongoOrder
 import com.eventphotobooth.app.data.PendingPaymongoOrderState
 import com.eventphotobooth.app.data.decodePaymongoQrImage
@@ -93,11 +99,21 @@ internal fun PaymongoCheckoutScreen(
     var workingOrder by remember(pendingOrder?.requestId) { mutableStateOf(pendingOrder) }
     var checkout by remember { mutableStateOf<PaymongoCheckout?>(null) }
     var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var readinessMessage by remember { mutableStateOf("Checking camera, printer, and payment service…") }
+    var readinessMessage by remember { mutableStateOf("Checking camera, printer, and payment service.") }
     var statusMessage by remember { mutableStateOf<String?>(null) }
     var lastPaymentStatus by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var clockMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+    var showPriceManager by remember { mutableStateOf(false) }
+
+    if (showPriceManager) {
+        PaymongoPriceManagementScreen(
+            configuration = configuration,
+            paymentClient = paymentClient,
+            onBack = { showPriceManager = false },
+        )
+        return
+    }
 
     fun savePending(order: PendingPaymongoOrder?) {
         workingOrder = order
@@ -294,7 +310,7 @@ internal fun PaymongoCheckoutScreen(
         Text("PAYMONGO QR PH", color = BoothPalette.forest, style = MaterialTheme.typography.headlineMedium)
         Text("STAGING CHECKOUT", color = BoothPalette.oxblood, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
         Text(
-            "${BuildConfig.PAYMONGO_ENVIRONMENT} • Secure server verification required",
+            "${BuildConfig.PAYMONGO_ENVIRONMENT}  Secure server verification required",
             color = BoothPalette.inkMuted,
             fontSize = 11.sp,
             modifier = Modifier.padding(top = 5.dp),
@@ -335,7 +351,7 @@ internal fun PaymongoCheckoutScreen(
                         }
                         if (state == PaymongoCheckoutState.PREPARING_QR || busy) {
                             CircularProgressIndicator(color = BoothPalette.forest, modifier = Modifier.size(30.dp))
-                            Text("Preparing a single-use QR…", color = BoothPalette.ink, textAlign = TextAlign.Center)
+                            Text("Preparing a single-use QR.", color = BoothPalette.ink, textAlign = TextAlign.Center)
                         } else if (state == PaymongoCheckoutState.READY_TO_START) {
                             Button(
                                 onClick = ::createOrResumeOrder,
@@ -349,6 +365,11 @@ internal fun PaymongoCheckoutScreen(
                                 ElevatedButton(onClick = requestCameraPermission, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("GRANT CAMERA PERMISSION") }
                             }
                             ElevatedButton(onClick = ::refreshReadiness, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("CHECK READINESS AGAIN") }
+                        }
+                        if (workingOrder == null && !busy) {
+                            OutlinedButton(onClick = { showPriceManager = true }, modifier = Modifier.fillMaxWidth()) {
+                                Text("OPERATOR PRICE MANAGEMENT")
+                            }
                         }
                     }
 
@@ -373,10 +394,10 @@ internal fun PaymongoCheckoutScreen(
                         Text("Order ${workingOrder?.orderId?.takeLast(8)?.uppercase().orEmpty()}", color = BoothPalette.inkMuted, fontSize = 11.sp)
                         if (state == PaymongoCheckoutState.CONFIRMING_PAYMENT || busy) {
                             CircularProgressIndicator(color = BoothPalette.forest, modifier = Modifier.size(30.dp))
-                            Text("Confirming securely…", color = BoothPalette.ink)
+                            Text("Confirming securely.", color = BoothPalette.ink)
                         } else {
                             Button(onClick = { scope.launch { checkPaymentStatus(showConfirming = true) } }, modifier = Modifier.fillMaxWidth().height(52.dp)) {
-                                Text("I HAVE PAID — CHECK STATUS")
+                                Text("I HAVE PAID - CHECK STATUS")
                             }
                         }
                         lastPaymentStatus?.let { Text("Provider status: $it", color = BoothPalette.inkMuted, fontSize = 11.sp) }
@@ -473,8 +494,116 @@ private fun QuantityOption(quantity: Int, selected: Boolean, enabled: Boolean, o
     ) { Text(quantity.toString(), color = text, fontWeight = FontWeight.Bold) }
 }
 
+/**
+ * The PIN is a local owner-control for the tablet UI. The server still scopes
+ * the actual change to the dedicated credential installed for this booth.
+ */
+@Composable
+private fun PaymongoPriceManagementScreen(
+    configuration: BoothConfiguration,
+    paymentClient: PaymongoPaymentClient,
+    onBack: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val prices = remember { mutableStateListOf<String>().apply { repeat(10) { add("") } } }
+    var ownerPin by remember { mutableStateOf("") }
+    var unlocked by remember { mutableStateOf(false) }
+    var loading by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+
+    fun loadPrices() {
+        loading = true
+        message = null
+        scope.launch {
+            paymentClient.priceTiers().onSuccess { tiers ->
+                prices.indices.forEach { index -> prices[index] = "" }
+                tiers.forEach { tier ->
+                    prices[tier.printQuantity - 1] = String.format(Locale.US, "%.2f", tier.amountMinor / 100.0)
+                }
+                message = if (tiers.isEmpty()) "No active server prices yet. Enter the quantities you want to sell." else "Loaded the active server prices."
+            }.onFailure { error ->
+                message = error.message ?: "Could not load prices. This tablet may need owner provisioning."
+            }
+            loading = false
+        }
+    }
+
+    fun savePrices() {
+        val tiers = prices.mapIndexedNotNull { index, raw ->
+            val amount = raw.trim().replace(",", "").toDoubleOrNull() ?: return@mapIndexedNotNull null
+            if (amount <= 0.0) return@mapIndexedNotNull null
+            PaymongoPriceTier(index + 1, (amount * 100).toInt())
+        }
+        if (tiers.isEmpty() || prices.any { it.isNotBlank() && (it.trim().replace(",", "").toDoubleOrNull() ?: 0.0) <= 0.0 }) {
+            message = "Enter at least one valid PHP price. Leave an unavailable quantity blank."
+            return
+        }
+        loading = true
+        message = null
+        scope.launch {
+            paymentClient.replacePriceTiers(tiers).onSuccess { saved ->
+                prices.indices.forEach { index -> prices[index] = "" }
+                saved.forEach { tier -> prices[tier.printQuantity - 1] = String.format(Locale.US, "%.2f", tier.amountMinor / 100.0) }
+                message = "Prices saved securely. New checkouts now use this version; existing orders keep their original price."
+            }.onFailure { error ->
+                message = error.message ?: "Could not save prices."
+            }
+            loading = false
+        }
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().background(BoothPalette.paper).padding(16.dp).verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("PAYMONGO PRICING", color = BoothPalette.forest, style = MaterialTheme.typography.headlineMedium)
+        Text("${configuration.deliveryBoothId.ifBlank { "UNPROVISIONED BOOTH" }}  owner control", color = BoothPalette.inkMuted, fontSize = 12.sp)
+        if (!unlocked) {
+            Text("Enter the local Business payment PIN to edit server-owned prices.", color = BoothPalette.inkMuted, textAlign = TextAlign.Center)
+            OutlinedTextField(
+                value = ownerPin,
+                onValueChange = { ownerPin = it.filter(Char::isDigit).take(12) },
+                label = { Text("Business payment PIN") },
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                singleLine = true,
+            )
+            Button(
+                enabled = ownerPin.isNotBlank() && !loading,
+                onClick = {
+                    if (ownerPin == configuration.businessPin) {
+                        unlocked = true
+                        ownerPin = ""
+                        loadPrices()
+                    } else message = "Incorrect Business payment PIN."
+                },
+            ) { Text("UNLOCK PRICING") }
+        } else {
+            Text("Set a PHP total for each quantity. Leave a row blank to hide that quantity from checkout.", color = BoothPalette.inkMuted, textAlign = TextAlign.Center)
+            (1..10).forEach { quantity ->
+                OutlinedTextField(
+                    value = prices[quantity - 1],
+                    onValueChange = { input -> prices[quantity - 1] = input.filter { it.isDigit() || it == '.' || it == ',' }.take(10) },
+                    label = { Text("$quantity print${if (quantity == 1) "" else "s"} - PHP") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    singleLine = true,
+                    enabled = !loading,
+                    modifier = Modifier.fillMaxWidth().widthIn(max = 480.dp),
+                )
+            }
+            Button(onClick = ::savePrices, enabled = !loading, modifier = Modifier.fillMaxWidth().widthIn(max = 480.dp).height(54.dp)) {
+                Text(if (loading) "SAVING." else "SAVE SERVER PRICES")
+            }
+        }
+        if (loading) CircularProgressIndicator(color = BoothPalette.forest, modifier = Modifier.size(28.dp))
+        message?.let { Text(it, color = if (it.contains("saved", ignoreCase = true) || it.contains("Loaded")) BoothPalette.forest else BoothPalette.error, textAlign = TextAlign.Center, fontSize = 12.sp) }
+        OutlinedButton(onClick = onBack, enabled = !loading, modifier = Modifier.widthIn(min = 240.dp)) { Text("RETURN TO CHECKOUT") }
+    }
+}
+
 internal fun formatPaymongoAmount(amountMinor: Int, currency: String): String = when (currency) {
-    "PHP" -> "₱" + String.format(Locale.US, "%.2f", amountMinor / 100.0)
+    "PHP" -> "?" + String.format(Locale.US, "%.2f", amountMinor / 100.0)
     else -> "$currency " + String.format(Locale.US, "%.2f", amountMinor / 100.0)
 }
 
