@@ -20,23 +20,98 @@ class LocalPrintQueue(
     }
 
     fun markPrinting(job: PrintJob): PrintJob {
-        val updated = job.copy(status = PrintStatus.PRINTING, attempts = job.attempts + 1)
+        require(!job.operatorAttentionRequired) { "This print has an uncertain physical outcome and needs operator confirmation before retrying." }
+        val updated = job.copy(
+            status = PrintStatus.PRINTING,
+            attempts = job.attempts + 1,
+            physicalOutcome = PhysicalPrintOutcome.SUBMITTING,
+            lastError = null,
+        )
         store.savePrintJob(updated)
         store.updatePrintStatus(job.sessionId, PrintStatus.PRINTING)
         return updated
     }
 
-    fun markPrinted(job: PrintJob): PrintJob {
-        val updated = job.copy(status = PrintStatus.PRINTED, lastError = null)
+    fun markCopyCompleted(job: PrintJob): PrintJob {
+        val updated = job.copy(
+            completedCopies = (job.completedCopies + 1).coerceAtMost(job.quantity),
+            physicalOutcome = PhysicalPrintOutcome.SUBMITTED,
+            status = if (job.completedCopies + 1 >= job.quantity) PrintStatus.SUBMITTED else PrintStatus.PRINTING,
+            lastError = null,
+        )
+        store.savePrintJob(updated)
+        store.updatePrintStatus(job.sessionId, updated.status)
+        return updated
+    }
+
+    /** Marks the next copy as actively writing to USB before any printer bytes are sent. */
+    fun markSubmittingNextCopy(job: PrintJob): PrintJob {
+        require(!job.operatorAttentionRequired) { "This print needs operator review before retrying." }
+        val updated = job.copy(
+            status = PrintStatus.PRINTING,
+            physicalOutcome = PhysicalPrintOutcome.SUBMITTING,
+            lastError = null,
+        )
+        store.savePrintJob(updated)
+        store.updatePrintStatus(job.sessionId, PrintStatus.PRINTING)
+        return updated
+    }
+
+    /**
+     * The USB transport accepted all bytes. This is intentionally not named
+     * "printed" because commodity USB receipt printers do not prove paper
+     * delivery back to Android.
+     */
+    fun markSubmitted(job: PrintJob): PrintJob {
+        val updated = job.copy(
+            status = PrintStatus.SUBMITTED,
+            completedCopies = job.quantity,
+            physicalOutcome = PhysicalPrintOutcome.SUBMITTED,
+            operatorAttentionRequired = false,
+            lastError = null,
+        )
         store.savePrintJob(updated)
         store.updatePrintStatus(job.sessionId, PrintStatus.PRINTED)
         return updated
     }
 
     fun markFailed(job: PrintJob, error: String): PrintJob {
-        val updated = job.copy(status = PrintStatus.FAILED, lastError = error)
+        val updated = job.copy(
+            status = PrintStatus.FAILED,
+            physicalOutcome = PhysicalPrintOutcome.FAILED_BEFORE_SUBMISSION,
+            operatorAttentionRequired = false,
+            lastError = error.take(220),
+        )
         store.savePrintJob(updated)
         store.updatePrintStatus(job.sessionId, PrintStatus.FAILED)
         return updated
     }
+
+    /** Call this if USB fails or disconnects after a submission attempt began. */
+    fun markOutcomeUncertain(job: PrintJob, error: String): PrintJob {
+        val updated = job.copy(
+            status = PrintStatus.FAILED,
+            physicalOutcome = PhysicalPrintOutcome.OUTCOME_UNCERTAIN,
+            operatorAttentionRequired = true,
+            lastError = "Output may have started. Confirm paper before retrying. ${error.take(150)}",
+        )
+        store.savePrintJob(updated)
+        store.updatePrintStatus(job.sessionId, PrintStatus.FAILED)
+        return updated
+    }
+
+    /** Records an operator's deliberate review before allowing the same job to retry. */
+    fun clearUncertainOutcomeForOperatorRetry(job: PrintJob): PrintJob {
+        require(job.operatorAttentionRequired) { "No operator review is required for this print." }
+        val updated = job.copy(
+            status = PrintStatus.QUEUED,
+            physicalOutcome = PhysicalPrintOutcome.QUEUED,
+            operatorAttentionRequired = false,
+            lastError = null,
+        )
+        store.savePrintJob(updated)
+        store.updatePrintStatus(job.sessionId, PrintStatus.QUEUED)
+        return updated
+    }
 }
+

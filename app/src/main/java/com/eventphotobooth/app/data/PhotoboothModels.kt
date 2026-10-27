@@ -2,6 +2,7 @@ package com.eventphotobooth.app.data
 
 import java.time.Instant
 import java.util.UUID
+import com.eventphotobooth.app.printer.PhysicalPrintOutcome
 
 data class BrandSnapshot(
     val organizerName: String = "Your venue",
@@ -15,6 +16,8 @@ enum class PrintStatus {
     NOT_QUEUED,
     QUEUED,
     PRINTING,
+    /** USB transport accepted the job; this is not a sensor-confirmed paper delivery. */
+    SUBMITTED,
     PRINTED,
     FAILED,
 }
@@ -58,4 +61,13 @@ data class PrintJob(
     val status: PrintStatus = PrintStatus.QUEUED,
     val attempts: Int = 0,
     val lastError: String? = null,
+    /**
+     * Physical fulfillment is intentionally separate from the legacy UI status.
+     * A USB write that disconnects mid-stream cannot be called failed safely:
+     * the printer may still have produced paper.
+     */
+    val completedCopies: Int = 0,
+    val physicalOutcome: PhysicalPrintOutcome = PhysicalPrintOutcome.QUEUED,
+    val operatorAttentionRequired: Boolean = false,
 )
+

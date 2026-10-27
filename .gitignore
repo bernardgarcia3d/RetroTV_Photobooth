@@ -2,6 +2,7 @@
 .gradle-*/
 .kotlin/
 .android/
+.android-user-home/
 .idea/
 build/
 **/build/
@@ -21,3 +22,4 @@ supabase/functions/.env
 supabase/functions/.env.local
 supabase/functions/.env.paymongo
 supabase/functions/.env.paymongo.local
+

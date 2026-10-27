@@ -365,6 +365,15 @@ fun EventPhotoboothApp() {
     val createPrintSession: (List<File>) -> Unit = { sourcePhotos ->
         val gifClipsForSession = gifClipFiles
         val authorizedPaymongoSession = activePaymongoSession
+        authorizedPaymongoSession?.let { paidSession ->
+            pendingPaymongoOrder
+                ?.takeIf { it.orderId == paidSession.orderId }
+                ?.let { pending ->
+                    val updated = pending.copy(state = com.eventphotobooth.app.data.PendingPaymongoOrderState.FULFILLMENT_PENDING)
+                    pendingPaymongoOrder = updated
+                    paymongoPendingOrderStore.save(updated)
+                }
+        }
         scope.launch {
             activeDeliveryUpload = null
             screen = BoothScreen.Processing(sourcePhotos, selectedLayout)
@@ -459,11 +468,12 @@ fun EventPhotoboothApp() {
                 val printResult = when (permittedPrinters.size) {
                     0 -> Result.failure(IllegalStateException("No USB printer with permission is available. The strip is queued for manual retry."))
                     1 -> {
-                        val printingJob = printQueue.markPrinting(printJob)
+                        var printingJob = printQueue.markPrinting(printJob)
                         screen = BoothScreen.PrintingAnimation(session.copy(printStatus = PrintStatus.PRINTING), PrintStatus.PRINTING, "Printing your strip")
                         runCatching {
                             withContext(Dispatchers.IO) {
-                                repeat(session.printQuantity) {
+                                repeat((session.printQuantity - printingJob.completedCopies).coerceAtLeast(0)) {
+                                    printingJob = printQueue.markSubmittingNextCopy(printingJob)
                                     printerDiscovery.printXp80tsStrip(
                                         deviceName = permittedPrinters.first().deviceName,
                                         stripFile = File(session.printStripPath),
@@ -471,6 +481,10 @@ fun EventPhotoboothApp() {
                                         ditherThreshold = configuration.thermalDitherThreshold,
                                         bottomFeedLines = configuration.receiptBottomFeedLines,
                                     ).getOrThrow()
+                                    // The USB adapter completed this copy's submission. A physical
+                                    // printer cannot promise exactly-once paper output, but progress
+                                    // is durable so a restart can show the remaining copy count.
+                                    printingJob = printQueue.markCopyCompleted(printingJob)
                                 }
                             }
                         }.map { printingJob }
@@ -478,7 +492,7 @@ fun EventPhotoboothApp() {
                     else -> Result.failure(IllegalStateException("More than one USB printer has permission. The strip is queued so the operator can choose the correct printer."))
                 }
                 printResult.onSuccess { printedJob ->
-                    printQueue.markPrinted(printedJob)
+                    printQueue.markSubmitted(printedJob)
                     authorizedPaymongoSession?.takeIf { it.sessionId == session.id }?.let { paidSession ->
                         scope.launch {
                             withContext(Dispatchers.IO) {
@@ -496,13 +510,22 @@ fun EventPhotoboothApp() {
                     }
                     scope.launch {
                         delay(600)
-                        screen = BoothScreen.DigitalDelivery(session.copy(printStatus = PrintStatus.PRINTED))
+                        screen = BoothScreen.DigitalDelivery(session.copy(printStatus = PrintStatus.SUBMITTED))
                     }
                 }.onFailure { error ->
                     val message = error.message ?: "Auto-print failed."
                     val latestJob = sessionStore.loadPrintJobs().firstOrNull { it.id == printJob.id } ?: printJob
-                    printQueue.markFailed(latestJob, message)
-                    screen = BoothScreen.Complete(session.copy(printStatus = PrintStatus.FAILED), PrintStatus.FAILED, message)
+                    val recoveredJob = if (latestJob.physicalOutcome == com.eventphotobooth.app.printer.PhysicalPrintOutcome.SUBMITTING) {
+                        printQueue.markOutcomeUncertain(latestJob, message)
+                    } else {
+                        printQueue.markFailed(latestJob, message)
+                    }
+                    val recoveryMessage = if (recoveredJob.operatorAttentionRequired) {
+                        "Print outcome is unknown. An operator must check the paper before retrying."
+                    } else {
+                        message
+                    }
+                    screen = BoothScreen.Complete(session.copy(printStatus = PrintStatus.FAILED), PrintStatus.FAILED, recoveryMessage)
                 }
             }.onFailure { error -> screen = BoothScreen.Failure(error.message ?: "The print strip could not be created.") }
         }
@@ -550,6 +573,16 @@ fun EventPhotoboothApp() {
                         if (updated == null) paymongoPendingOrderStore.clear() else paymongoPendingOrderStore.save(updated)
                     },
                     onPaymentAuthorized = { authorized ->
+                        activePaymongoSession = authorized
+                        printQuantity = authorized.printQuantity
+                        redeemedAccessCode = null
+                        stickers = emptyList()
+                        guestBrightness = 50f
+                        screen = BoothScreen.LayoutSelection
+                    },
+                    onRecoverClaimedSession = { authorized ->
+                        // Deliberate recovery only. We never resume a prior guest automatically
+                        // when the app restarts or a new walk-up guest opens the kiosk.
                         activePaymongoSession = authorized
                         printQuantity = authorized.printQuantity
                         redeemedAccessCode = null
@@ -4623,6 +4656,11 @@ private fun OperatorSettingsScreen(
         )
         if (selectedTab == OperatorSettingsTab.PRINT_QUEUE) PrintQueueCard(
             jobs = visiblePrintJobs,
+            onApproveUncertainRetry = { job ->
+                printQueue.clearUncertainOutcomeForOperatorRetry(job)
+                visiblePrintJobs = sessionStore.loadPrintJobs().asReversed()
+                printerPermissionMessage = "Operator review recorded. Retry only the remaining ${job.quantity - job.completedCopies} copy/copies when ready."
+            },
             onRetry = { job ->
                 val permittedPrinters = discovery.discover().filter { it.hasPermission }
                 if (permittedPrinters.size != 1) {
@@ -4631,11 +4669,12 @@ private fun OperatorSettingsScreen(
                 } else {
                     printerPermissionMessage = "Retrying print job..."
                     scope.launch {
-                        val printingJob = printQueue.markPrinting(job)
+                        var printingJob = printQueue.markPrinting(job)
                         visiblePrintJobs = sessionStore.loadPrintJobs().asReversed()
                         val result = runCatching {
                             withContext(Dispatchers.IO) {
-                                repeat(job.quantity) {
+                                repeat((job.quantity - printingJob.completedCopies).coerceAtLeast(0)) {
+                                    printingJob = printQueue.markSubmittingNextCopy(printingJob)
                                     discovery.printXp80tsStrip(
                                         deviceName = permittedPrinters.first().deviceName,
                                         stripFile = File(job.stripPath),
@@ -4643,15 +4682,21 @@ private fun OperatorSettingsScreen(
                                         ditherThreshold = thermalDitherThreshold.roundToInt(),
                                         bottomFeedLines = receiptBottomFeedLines.roundToInt(),
                                     ).getOrThrow()
+                                    printingJob = printQueue.markCopyCompleted(printingJob)
                                 }
                             }
                         }
                         result.onSuccess {
-                            printQueue.markPrinted(printingJob)
+                            printQueue.markSubmitted(printingJob)
                             printerPermissionMessage = "Print job sent."
                         }.onFailure { error ->
-                            printQueue.markFailed(printingJob, error.message ?: "Retry failed.")
-                            printerPermissionMessage = error.message ?: "Retry failed."
+                            val latestJob = sessionStore.loadPrintJobs().firstOrNull { it.id == job.id } ?: printingJob
+                            val recovered = if (latestJob.physicalOutcome == com.eventphotobooth.app.printer.PhysicalPrintOutcome.SUBMITTING) {
+                                printQueue.markOutcomeUncertain(latestJob, error.message ?: "USB submission interrupted.")
+                            } else {
+                                printQueue.markFailed(latestJob, error.message ?: "Retry failed.")
+                            }
+                            printerPermissionMessage = recovered.lastError ?: "Retry failed."
                         }
                         visiblePrintJobs = sessionStore.loadPrintJobs().asReversed()
                         usbDevices = discovery.discover()
@@ -4796,11 +4841,15 @@ private fun ProvisioningSettingsScreen(
 }
 
 @Composable
-private fun PrintQueueCard(jobs: List<PrintJob>, onRetry: (PrintJob) -> Unit) {
+private fun PrintQueueCard(
+    jobs: List<PrintJob>,
+    onRetry: (PrintJob) -> Unit,
+    onApproveUncertainRetry: (PrintJob) -> Unit,
+) {
     Card(colors = CardDefaults.cardColors(Color(0xFF172225))) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("PRINT QUEUE", color = Color.White, style = MaterialTheme.typography.titleMedium)
-            Text("Check paper, close the printer cover, confirm USB permission, then retry failed or queued jobs.", color = Color(0xFFD6E6DF), fontSize = 12.sp)
+            Text("Check paper, close the printer cover, and confirm USB permission. A USB interruption during submission must be inspected before retrying.", color = Color(0xFFD6E6DF), fontSize = 12.sp)
             if (jobs.isEmpty()) {
                 Text("No print jobs yet.", color = Color(0xFFD6E6DF), modifier = Modifier.padding(top = 6.dp))
             }
@@ -4813,7 +4862,10 @@ private fun PrintQueueCard(jobs: List<PrintJob>, onRetry: (PrintJob) -> Unit) {
                         }
                         Text("Session ${job.sessionId.take(8)}  •  ${job.quantity} print${if (job.quantity == 1) "" else "s"}", color = Color.White, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
                         job.lastError?.let { Text("Last error: $it", color = Color(0xFFFFD8A8), fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp)) }
-                        if (job.status == PrintStatus.FAILED || job.status == PrintStatus.QUEUED) {
+                        if (job.operatorAttentionRequired) {
+                            Text("Check whether paper came out before enabling a retry.", color = Color(0xFFFFD8A8), fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+                            ElevatedButton(onClick = { onApproveUncertainRetry(job) }, modifier = Modifier.padding(top = 8.dp)) { Text("I CHECKED OUTPUT — ENABLE RETRY") }
+                        } else if (job.status == PrintStatus.FAILED || job.status == PrintStatus.QUEUED) {
                             ElevatedButton(onClick = { onRetry(job) }, modifier = Modifier.padding(top = 8.dp)) { Text("Retry print") }
                         }
                     }
@@ -4828,6 +4880,7 @@ private val PrintStatus.label: String
         PrintStatus.NOT_QUEUED -> "Not queued"
         PrintStatus.QUEUED -> "Queued"
         PrintStatus.PRINTING -> "Printing"
+        PrintStatus.SUBMITTED -> "Submitted to printer"
         PrintStatus.PRINTED -> "Printed"
         PrintStatus.FAILED -> "Failed"
     }
@@ -4836,6 +4889,7 @@ private fun PrintStatus.statusColor(): Color = when (this) {
     PrintStatus.PRINTED -> Color(0xFFB4F5D1)
     PrintStatus.FAILED -> Color(0xFFFFB4AB)
     PrintStatus.PRINTING -> Color(0xFFFFD8A8)
+    PrintStatus.SUBMITTED -> Color(0xFFB4F5D1)
     PrintStatus.QUEUED -> Color(0xFFD6E6DF)
     PrintStatus.NOT_QUEUED -> Color(0xFF9AA8A2)
 }
@@ -5062,3 +5116,4 @@ private fun LandingScreenPreview() {
         )
     }
 }
+

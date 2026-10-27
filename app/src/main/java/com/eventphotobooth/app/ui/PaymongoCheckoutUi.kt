@@ -84,6 +84,7 @@ internal fun PaymongoCheckoutScreen(
     checkPrinter: suspend () -> PaymongoPrinterReadiness,
     onPendingOrderChange: (PendingPaymongoOrder?) -> Unit,
     onPaymentAuthorized: (PaymongoAuthorizedSession) -> Unit,
+    onRecoverClaimedSession: (PaymongoAuthorizedSession) -> Unit,
     onBack: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
@@ -126,7 +127,8 @@ internal fun PaymongoCheckoutScreen(
             }
             state = when {
                 savedOrder != null && savedOrder.boothId != configuration.deliveryBoothId -> PaymongoCheckoutState.ERROR
-                savedOrder?.state == PendingPaymongoOrderState.SESSION_CLAIMED -> PaymongoCheckoutState.RECOVERY_REQUIRED
+                savedOrder?.state == PendingPaymongoOrderState.SESSION_CLAIMED ||
+                    savedOrder?.state == PendingPaymongoOrderState.FULFILLMENT_PENDING -> PaymongoCheckoutState.RECOVERY_REQUIRED
                 !hasCameraPermission || configurationIssue != null || !printer.ready || !paymentService -> PaymongoCheckoutState.ERROR
                 savedOrder?.qrImageData != null && (savedOrder.qrExpiresAtEpochMillis ?: 0) > System.currentTimeMillis() -> {
                     qrBitmap = decodePaymongoQrImage(requireNotNull(savedOrder.qrImageData))
@@ -390,9 +392,40 @@ internal fun PaymongoCheckoutScreen(
                     }
 
                     PaymongoCheckoutState.RECOVERY_REQUIRED -> {
-                        Text("PAID SESSION RECOVERY REQUIRED", color = BoothPalette.oxblood, style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center)
-                        Text("A paid session was already claimed on this tablet. It will not be reassigned automatically to another guest.", color = BoothPalette.inkMuted, textAlign = TextAlign.Center)
-                        Text("Phase 5 adds the operator recovery workflow for this situation.", color = BoothPalette.inkMuted, fontSize = 12.sp, textAlign = TextAlign.Center)
+                        val fulfillmentPending = workingOrder?.state == PendingPaymongoOrderState.FULFILLMENT_PENDING
+                        Text(if (fulfillmentPending) "FULFILLMENT RECOVERY REQUIRED" else "PAID SESSION RECOVERY REQUIRED", color = BoothPalette.oxblood, style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center)
+                        Text(
+                            if (fulfillmentPending) {
+                                "This paid order already entered media or printing. Do not restart capture or charge the guest again. An operator must review its existing print job."
+                            } else {
+                                "A paid session was already claimed on this tablet. It will not be reassigned automatically to another guest."
+                            },
+                            color = BoothPalette.inkMuted,
+                            textAlign = TextAlign.Center,
+                        )
+                        if (!fulfillmentPending) {
+                            Text("Only resume this if the original guest is still present. This does not create another payment or another session.", color = BoothPalette.inkMuted, fontSize = 12.sp, textAlign = TextAlign.Center)
+                            Button(
+                                onClick = {
+                                    val order = workingOrder
+                                    val sessionId = order?.sessionId
+                                    if (order == null || sessionId.isNullOrBlank()) {
+                                        showError("The saved paid session is incomplete. Ask the operator to reconcile the original order.")
+                                    } else {
+                                        onRecoverClaimedSession(
+                                            PaymongoAuthorizedSession(
+                                                orderId = order.orderId,
+                                                sessionId = sessionId,
+                                                printQuantity = order.printQuantity,
+                                                amountMinor = order.amountMinor,
+                                                currency = order.currency,
+                                            ),
+                                        )
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth().height(54.dp),
+                            ) { Text("RESUME ORIGINAL PAID SESSION") }
+                        }
                         OutlinedButton(onClick = onBack, modifier = Modifier.fillMaxWidth()) { Text("RETURN TO START") }
                     }
                 }
@@ -446,3 +479,4 @@ internal fun formatPaymongoAmount(amountMinor: Int, currency: String): String = 
 }
 
 private fun formatCountdown(seconds: Long): String = "%02d:%02d".format(Locale.US, seconds / 60, seconds % 60)
+

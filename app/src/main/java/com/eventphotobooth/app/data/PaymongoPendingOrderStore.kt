@@ -6,6 +6,8 @@ import org.json.JSONObject
 enum class PendingPaymongoOrderState {
     AWAITING_PAYMENT,
     SESSION_CLAIMED,
+    /** Media/print work has started; never re-open capture for a new guest. */
+    FULFILLMENT_PENDING,
 }
 
 /**
@@ -78,3 +80,4 @@ class PaymongoPendingOrderStore(context: Context) {
         const val PENDING_ORDER_KEY = "pending_order"
     }
 }
+

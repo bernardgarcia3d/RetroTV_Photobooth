@@ -120,6 +120,9 @@ class LocalSessionStore(context: Context) {
         .put("status", job.status.name)
         .put("attempts", job.attempts)
         .put("lastError", job.lastError)
+        .put("completedCopies", job.completedCopies)
+        .put("physicalOutcome", job.physicalOutcome.name)
+        .put("operatorAttentionRequired", job.operatorAttentionRequired)
 
     private fun printJobFromJson(value: JSONObject) = PrintJob(
         id = value.getString("id"),
@@ -129,6 +132,13 @@ class LocalSessionStore(context: Context) {
         status = PrintStatus.valueOf(value.getString("status")),
         attempts = value.getInt("attempts"),
         lastError = value.optString("lastError").takeIf { it.isNotBlank() },
+        completedCopies = value.optInt("completedCopies", 0).coerceIn(0, value.optInt("quantity", 1).coerceIn(1, 10)),
+        physicalOutcome = runCatching {
+            com.eventphotobooth.app.printer.PhysicalPrintOutcome.valueOf(
+                value.optString("physicalOutcome", com.eventphotobooth.app.printer.PhysicalPrintOutcome.QUEUED.name),
+            )
+        }.getOrDefault(com.eventphotobooth.app.printer.PhysicalPrintOutcome.QUEUED),
+        operatorAttentionRequired = value.optBoolean("operatorAttentionRequired", false),
     )
 
     private fun JSONArray.toStringList() = buildList {
@@ -270,3 +280,4 @@ class LocalSessionStore(context: Context) {
         const val PRINT_JOBS_KEY = "print_jobs"
     }
 }
+
