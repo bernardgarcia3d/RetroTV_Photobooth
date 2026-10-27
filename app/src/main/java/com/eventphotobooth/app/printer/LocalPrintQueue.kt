@@ -71,7 +71,7 @@ class LocalPrintQueue(
             lastError = null,
         )
         store.savePrintJob(updated)
-        store.updatePrintStatus(job.sessionId, PrintStatus.PRINTED)
+        store.updatePrintStatus(job.sessionId, PrintStatus.SUBMITTED)
         return updated
     }
 
